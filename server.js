@@ -1,8 +1,8 @@
-// Woody Polymarket — local test server. No Firebase and no npm packages needed.
+// Woody Polymarket — local test server. No npm packages needed.
 //   node server.js        then open http://localhost:8080
-// Serves the site/ folder, keeps accounts and data in local-data.json, streams changes
-// to every open page, and applies the same permissions as firestore.rules.
-// Owner: WOODY_OWNER env var, else ownerUsername in site/config.js, else the first account created.
+// Serves the site/ folder and keeps accounts and data in local-data.json. Same API and
+// permissions as the Cloudflare version in functions/api/[[route]].js.
+// Owner: WOODY_OWNER env var, else the first account created.
 "use strict";
 const http = require("http"), fs = require("fs"), path = require("path"), crypto = require("crypto");
 
@@ -18,19 +18,15 @@ const MIME = {
   ".json": "application/json", ".svg": "image/svg+xml", ".png": "image/png", ".jpg": "image/jpeg", ".ico": "image/x-icon"
 };
 
-function configOwner() {
-  try {
-    const m = fs.readFileSync(path.join(SITE, "config.js"), "utf8").match(/ownerUsername:\s*"([^"]*)"/);
-    return m && m[1] !== "YOUR_USERNAME" ? m[1].toLowerCase() : null;
-  } catch { return null; }
-}
-const OWNER = (process.env.WOODY_OWNER || "").toLowerCase() || configOwner();
+const OWNER = (process.env.WOODY_OWNER || "").toLowerCase() || null;
 
 // ---------- storage ----------
 // users: username -> {uid, salt, hash}; sessions: token -> uid; docs: "collection/id" -> object
-let data = { users: {}, sessions: {}, docs: {}, firstUser: null };
+// vers: "collection/id" -> version number of its last write; seq: the latest version number
+let data = { users: {}, sessions: {}, docs: {}, vers: {}, seq: 0, firstUser: null };
 try { data = { ...data, ...JSON.parse(fs.readFileSync(DATA_FILE, "utf8")) }; } catch {}
 const save = () => fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 1));
+const putDoc = (p, doc) => { data.docs[p] = doc; data.vers[p] = ++data.seq; };
 
 const nameOf = uid => Object.keys(data.users).find(n => data.users[n].uid === uid) || null;
 const isOwner = uid => { const n = nameOf(uid); return !!n && n === (OWNER || data.firstUser); };
@@ -47,20 +43,12 @@ const MEMBER_STATUSES = ["approved", "rejected", "removed"];
 let migrated = false;
 for (const [name, u] of Object.entries(data.users)) {
   if (data.docs["members/" + u.uid]) continue;
-  data.docs["members/" + u.uid] = { status: "approved", name, requestedAt: Date.now(), ...(isOwner(u.uid) ? { owner: true } : {}) };
+  putDoc("members/" + u.uid, { status: "approved", name, requestedAt: Date.now(), ...(isOwner(u.uid) ? { owner: true } : {}) });
   migrated = true;
 }
+// Data saved before version numbers existed.
+for (const p of Object.keys(data.docs)) if (!data.vers[p]) { data.vers[p] = ++data.seq; migrated = true; }
 if (migrated) save();
-
-// ---------- live updates (Server-Sent Events) ----------
-// Each open page gets only what its user may read: everything for members,
-// just their own membership record for everyone else.
-const streams = new Map(); // res -> uid
-function broadcast(p) {
-  const msg = `event: change\ndata: ${JSON.stringify({ path: p, data: data.docs[p] ?? null })}\n\n`;
-  for (const [res, uid] of streams) if (canRead(uid, p)) res.write(msg);
-}
-setInterval(() => { for (const res of streams.keys()) res.write(": ping\n\n"); }, 25000).unref();
 
 // ---------- permissions (mirrors firestore.rules) ----------
 function allowed(uid, p, prev, next) {
@@ -110,18 +98,17 @@ function startSession(res, uid, body) {
 }
 
 // ---------- api ----------
-async function api(req, res, route) {
+async function api(req, res, route, query) {
   const uid = sessionUid(req);
   if (req.method === "GET" && route === "me") {
     return json(res, 200, uid ? { uid, name: nameOf(uid), isOwner: isOwner(uid) } : { uid: null });
   }
-  if (req.method === "GET" && route === "stream") {
+  // Changes since a version number. Members see everything; others only their own membership record.
+  if (req.method === "GET" && route === "sync") {
     if (!uid) return fail(res, 401, "permission-denied", "Sign in first.");
-    res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-store", Connection: "keep-alive" });
-    const visible = Object.fromEntries(Object.entries(data.docs).filter(([p]) => canRead(uid, p)));
-    res.write(`event: init\ndata: ${JSON.stringify(visible)}\n\n`);
-    streams.set(res, uid); req.on("close", () => streams.delete(res));
-    return;
+    const since = Math.max(0, Number(query.get("since")) || 0);
+    const docs = Object.fromEntries(Object.entries(data.docs).filter(([p]) => data.vers[p] > since && canRead(uid, p)));
+    return json(res, 200, { ver: data.seq, docs });
   }
   if (req.method !== "POST") return fail(res, 404, "not-found", "No such endpoint.");
   if (!(req.headers["content-type"] || "").startsWith("application/json")) return fail(res, 415, "invalid-argument", "Send JSON.");
@@ -137,11 +124,10 @@ async function api(req, res, route) {
       const salt = crypto.randomBytes(16).toString("hex"), newUid = crypto.randomBytes(14).toString("hex");
       data.users[name] = { uid: newUid, salt, hash: hashPw(pw, salt) };
       data.firstUser ||= name;
-      data.docs["profiles/" + newUid] = { name, photo: "" };
-      data.docs["members/" + newUid] = isOwner(newUid)
+      putDoc("profiles/" + newUid, { name, photo: "" });
+      putDoc("members/" + newUid, isOwner(newUid)
         ? { status: "approved", owner: true, name, requestedAt: Date.now() }
-        : { status: "pending", name, requestedAt: Date.now() };
-      broadcast("profiles/" + newUid); broadcast("members/" + newUid);
+        : { status: "pending", name, requestedAt: Date.now() });
       return startSession(res, newUid, { uid: newUid });
     }
     const u = data.users[name];
@@ -165,7 +151,7 @@ async function api(req, res, route) {
     if (op !== "set" && op !== "update") return fail(res, 400, "invalid-argument", "Unknown op.");
     const next = op === "set" ? doc : { ...prev, ...doc };
     if (!allowed(uid, p, prev, next)) return fail(res, 403, "permission-denied", "Not allowed.");
-    data.docs[p] = next; save(); broadcast(p);
+    putDoc(p, next); save();
     return json(res, 200, {});
   }
   return fail(res, 404, "not-found", "No such endpoint.");
@@ -173,11 +159,6 @@ async function api(req, res, route) {
 
 // ---------- static files ----------
 function serveStatic(req, res, urlPath) {
-  // Swap in a local config so the page talks to this server instead of Firebase.
-  if (urlPath === "/config.js") {
-    res.writeHead(200, { "Content-Type": MIME[".js"], "Cache-Control": "no-store" });
-    return res.end("window.WOODY_LOCAL = {};\n");
-  }
   let rel;
   try { rel = decodeURIComponent(urlPath); } catch { res.writeHead(400); return res.end(); }
   const file = path.resolve(SITE, "." + (rel.endsWith("/") ? rel + "index.html" : rel));
@@ -190,9 +171,9 @@ function serveStatic(req, res, urlPath) {
 }
 
 http.createServer((req, res) => {
-  const urlPath = (req.url || "/").split("?")[0];
+  const url = new URL(req.url || "/", "http://localhost"), urlPath = url.pathname;
   if (urlPath.startsWith("/api/")) {
-    return api(req, res, urlPath.slice(5)).catch(e => { console.error(e); if (!res.headersSent) fail(res, 500, "internal", "Server error."); });
+    return api(req, res, urlPath.slice(5), url.searchParams).catch(e => { console.error(e); if (!res.headersSent) fail(res, 500, "internal", "Server error."); });
   }
   serveStatic(req, res, urlPath);
 }).listen(PORT, HOST, () => {

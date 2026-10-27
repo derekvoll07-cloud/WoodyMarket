@@ -12,10 +12,6 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Outfit:wght@500;700;800&family=Atkinson+Hyperlegible:wght@400;700&family=JetBrains+Mono:wght@400;600&display=swap">
 <link rel="stylesheet" href="css/style.css">
-<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
-<script src="config.js"></script>
 </head>
 <body>
 
@@ -833,8 +829,8 @@ async function seedExamples(btn){
 }
 
 // ---------- platforms ----------
-// Inside claude.ai the page uses the built-in shared store. On a self-hosted copy
-// (window.WOODY_FIREBASE set), the same calls go to Firebase with username + password sign-in.
+// Inside claude.ai the page uses the built-in shared store. Anywhere else it talks to its own
+// /api: Cloudflare Pages Functions when hosted, or node server.js when testing locally.
 async function claudePlatform(){
   const cl=window.claude; if (!cl?.use) return null;
   const [db,user]=await Promise.all([cl.use("db"), cl.use("user")]);
@@ -844,55 +840,22 @@ const initialAvatar = (name) => {
   const ch=esc((name||"?").trim().charAt(0).toUpperCase()||"?");
   return "data:image/svg+xml,"+encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40"><rect width="40" height="40" rx="20" fill="#0441B4"/><text x="20" y="26" font-size="18" font-family="sans-serif" text-anchor="middle" fill="#fff">${ch}</text></svg>`);
 };
-// Usernames sign in through Firebase's email/password provider. Each username maps to an
-// address on a reserved domain that never receives mail, so players never enter an email.
-const USER_DOMAIN = "woody.example.com";
 const USERNAME_RE = /^[a-z0-9_-]{3,20}$/;
-const usernameOf = email => (email||"").split("@")[0];
 function authErr(e){
   const c=e?.code||"";
   if (/invalid-credential|wrong-password|user-not-found|invalid-login/.test(c)) return "Wrong username or password.";
   if (c.includes("email-already-in-use")) return "That username is taken. Pick another, or sign in if it's yours.";
   if (c.includes("weak-password")) return "Passwords need at least 6 characters.";
   if (c.includes("too-many-requests")) return "Too many tries. Wait a few minutes and try again.";
-  if (c.includes("operation-not-allowed")) return "Password sign-in isn't switched on for this board yet. Turn on Email/Password in Firebase Authentication.";
-  if (/api-key|configuration-not-found|invalid-app|app-not-authorized|unauthorized-domain/.test(c)) return "This board's Firebase settings aren't right. Check site/config.js and the README.";
-  if (c.includes("network")) return "Couldn't reach the server. Check your connection.";
+  if (c.includes("not-configured")) return "This board's database isn't set up yet. See the README.";
+  if (e instanceof TypeError) return "Couldn't reach the server. Check your connection.";
   console.warn("Sign-in failed:", e);
   return "That didn't work. Try again." + (c ? ` (${c})` : "");
 }
-async function firebasePlatform(cfg){
-  firebase.initializeApp(cfg.firebaseConfig);
-  const auth=firebase.auth(), fs=firebase.firestore();
-  const u = await new Promise(r=>{ const off=auth.onAuthStateChanged(x=>{ off(); r(x); }); });
-  const isOwner = !!u && (u.email||"").toLowerCase()===((cfg.ownerUsername||"").toLowerCase()+"@"+USER_DOMAIN);
-  const myName = u ? (u.displayName || usernameOf(u.email)) : "";
-  const prof=new Map();
-  if (u){
-    try{ await fs.doc("profiles/"+u.uid).set({name:myName, photo:u.photoURL||""}); }catch{}
-    fs.collection("profiles").onSnapshot(s=>{ s.docs.forEach(d=>prof.set(d.id,d.data())); if (S._ms) hydrateNames(document); }, ()=>{});
-  }
-  const user={
-    me: async()=>({id:u?.uid||null, name:myName, avatarUrl:u?.photoURL||initialAvatar(myName), isOwner, canEdit:isOwner, email:u?.email||null}),
-    can: async()=> u ? null : false,
-    profiles: async ids=>{ const out={}; for (const id of [].concat(ids)){ const p=prof.get(id); out[id]={id, name:p?.name||"", avatarUrl:p?.photo||initialAvatar(p?.name), isMe:id===u?.uid}; } return out; }
-  };
-  return {
-    kind:"firebase", db: u ? fs : null, user, signedIn:!!u,
-    signIn: async(name, pass, create)=>{
-      const email=name+"@"+USER_DOMAIN;
-      try{
-        if (create){ const c=await auth.createUserWithEmailAndPassword(email, pass); await c.user.updateProfile({displayName:name}); }
-        else await auth.signInWithEmailAndPassword(email, pass);
-        location.reload(); return null;
-      }catch(e){ return authErr(e); }
-    },
-    signOut: async()=>{ await auth.signOut(); location.reload(); }
-  };
-}
-// Local test server (node server.js): the same calls go over fetch to the Node server,
-// and changes stream back over Server-Sent Events.
-async function localPlatform(){
+// The page's own server. Writes go over fetch; changes come back by asking every few
+// seconds for anything newer than the last version seen.
+const POLL_MS = 4000;
+async function apiPlatform(){
   const api = async (route, body) => {
     const r = await fetch("/api/"+route, body ? {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)} : {});
     const j = await r.json().catch(()=>({}));
@@ -907,7 +870,7 @@ async function localPlatform(){
     profiles: async ids=>{ const out={}; for (const id of [].concat(ids)){ const p=docs.get("profiles/"+id); out[id]={id, name:p?.name||"", avatarUrl:initialAvatar(p?.name), isMe:id===me.uid}; } return out; }
   };
   const P = {
-    kind:"local", db:null, user, signedIn:!!me.uid,
+    kind:"api", db:null, user, signedIn:!!me.uid,
     signIn: async(name, pass, create)=>{ try{ await api(create?"signup":"login", {username:name, password:pass}); location.reload(); return null; }catch(e){ return authErr(e); } },
     signOut: async()=>{ await api("logout", {}); location.reload(); }
   };
@@ -917,23 +880,36 @@ async function localPlatform(){
   const snap = p => { const d=docs.get(p); return {id:p.slice(p.indexOf("/")+1), exists:d!==undefined, data:()=>structuredClone(d)}; };
   const fire = s => s.key.includes("/") ? s.fn(snap(s.key)) : s.fn({docs:[...docs.keys()].filter(k=>k.startsWith(s.key+"/")).map(snap)});
   const listen = (key, fn) => { const s={key, fn}; subs.add(s); queueMicrotask(()=>fire(s)); return ()=>subs.delete(s); };
+  let ver=0, pulling=null, again=false, timer=null;
+  const fetchChanges = async()=>{
+    const r = await api("sync?since="+ver);
+    const changed = Object.keys(r.docs);
+    for (const p of changed) docs.set(p, r.docs[p]);
+    ver = r.ver;
+    if (!changed.length) return;
+    const keys = new Set(changed.flatMap(p=>[p, p.split("/")[0]]));
+    subs.forEach(s=>{ if (keys.has(s.key)) fire(s); });
+    if (changed.some(p=>p.startsWith("profiles/")) && S._ms) hydrateNames(document);
+  };
+  // One request at a time; a pull asked for mid-request runs again straight after.
+  const pull = ()=>{
+    if (pulling){ again=true; return pulling; }
+    clearTimeout(timer);
+    pulling = (async()=>{
+      do { again=false; await fetchChanges(); } while (again);
+    })().catch(e=>{ if (e.code==="permission-denied") location.reload(); else console.warn(e); })
+      .finally(()=>{ pulling=null; if (!document.hidden) timer=setTimeout(pull, POLL_MS); });
+    return pulling;
+  };
+  const write = (op, p, d) => api("write", {op, path:p, data:d}).then(r=>{ pull(); return r; });
   const ref = p => ({ id:p.slice(p.indexOf("/")+1),
-    set: d=>api("write", {op:"set", path:p, data:d}),
-    update: d=>api("write", {op:"update", path:p, data:d}),
+    set: d=>write("set", p, d),
+    update: d=>write("update", p, d),
     onSnapshot: fn=>listen(p, fn) });
   P.db = { doc:ref, collection: c=>({ doc:()=>ref(c+"/"+uidMint()), onSnapshot: fn=>listen(c, fn) }) };
-  await new Promise((resolve, reject)=>{
-    let ready=false;
-    const es=new EventSource("/api/stream");
-    es.addEventListener("init", e=>{ docs.clear(); for (const [k,v] of Object.entries(JSON.parse(e.data))) docs.set(k,v); if (ready) subs.forEach(fire); ready=true; resolve(); });
-    es.addEventListener("change", e=>{
-      const {path:p, data:d}=JSON.parse(e.data); const col=p.split("/")[0];
-      if (d==null) docs.delete(p); else docs.set(p,d);
-      subs.forEach(s=>{ if (s.key===p || s.key===col) fire(s); });
-      if (col==="profiles" && S._ms) hydrateNames(document);
-    });
-    es.onerror = ()=>{ if (!ready){ es.close(); reject(new Error("Can't reach the local server")); } };
-  });
+  await fetchChanges();
+  timer = setTimeout(pull, POLL_MS);
+  document.addEventListener("visibilitychange", ()=>{ if (!document.hidden) pull(); });
   return P;
 }
 function applyMods(){
@@ -952,23 +928,16 @@ async function boot(){
   const [v,id]=routeFromHash(); S.view=v; S.marketId=id;
   document.querySelectorAll("#tabs button").forEach(b=>b.setAttribute("aria-current", b.dataset.view===v ? "page":"false"));
   let P=null;
-  // Opening index.html as a file (or before Firebase is filled in) loads the placeholder
-  // config.js, so sign-in could never work. Say how to run it instead of showing a dead form.
-  const fb=window.WOODY_FIREBASE;
-  const fbUnset = fb && Object.values(fb.firebaseConfig||{}).some(v=>!v || v==="PASTE_HERE");
-  if (!window.WOODY_LOCAL && (location.protocol==="file:" || fbUnset)){
+  // Opened as a file there's no server behind the page, so sign-in could never work.
+  // Say how to run it instead of showing a dead form.
+  if (location.protocol==="file:"){
     main.innerHTML=`<div class="empty"><h3>This board isn't connected yet</h3>
-      <p>To try it on this computer, run <code>node server.js</code> in the project folder, then open <a href="http://localhost:8080/">http://localhost:8080</a>. Opening index.html directly won't work.</p>
-      <p>To put it online, fill in the Firebase settings in <code>site/config.js</code> (see the README).</p></div>`;
+      <p>To try it on this computer, run <code>node server.js</code> in the project folder, then open <a href="http://localhost:8080/">http://localhost:8080</a>. Opening index.html directly won't work.</p></div>`;
     return;
   }
-  try{
-    P = window.WOODY_LOCAL ? await localPlatform()
-      : (window.WOODY_FIREBASE && window.firebase) ? await firebasePlatform(window.WOODY_FIREBASE)
-      : await claudePlatform();
-  }
+  try{ P = window.claude?.use ? await claudePlatform() : await apiPlatform(); }
   catch(e){ console.error(e); }
-  if (!P){ main.innerHTML=`<div class="empty"><h3>This board can't connect</h3><p>Open it on claude.ai, check the Firebase settings in your hosted copy, or if you're testing locally, make sure <code>node server.js</code> is running.</p></div>`; return; }
+  if (!P){ main.innerHTML=`<div class="empty"><h3>This board can't connect</h3><p>The server didn't answer. Try again in a minute. If you're testing locally, make sure <code>node server.js</code> is running.</p></div>`; return; }
   S.platform=P; S.db=P.db; S.user=P.user;
   const slot=$("#auth-slot");
   if (P.kind!=="claude" && P.signedIn){ slot.hidden=false; slot.innerHTML = `<button class="btn small ghost" id="signout">Sign out</button>`; }
