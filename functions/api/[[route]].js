@@ -92,7 +92,9 @@ async function allowed(db, c, p, prev, next) {
 
 // ---------- api ----------
 // The D1 binding is normally named DB, but any single D1 binding works.
-const findDb = env => env.DB || Object.values(env).find(v => v && typeof v.prepare === "function" && typeof v.batch === "function");
+// ASSETS (the static files) is a service stub that answers to any method name, so skip it.
+const findDb = env => env.DB || Object.entries(env).find(([k, v]) => k !== "ASSETS" && v && typeof v === "object"
+  && typeof v.prepare === "function" && typeof v.batch === "function")?.[1];
 
 export async function onRequest(context) {
   try { return await handle(context); }
