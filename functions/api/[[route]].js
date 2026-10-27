@@ -149,7 +149,7 @@ async function handle({ request, env, params }) {
       : (await db.prepare("SELECT path, data FROM docs WHERE ver > ? AND path = ?").bind(since, "members/" + uid).all()).results;
     const docs = {};
     for (const r of rows) docs[r.path] = JSON.parse(r.data);
-    return json(200, { ver: top.v, docs });
+    return json(200, { uid, ver: top.v, docs });
   }
 
   if (request.method !== "POST") return fail(404, "not-found", "No such endpoint.");

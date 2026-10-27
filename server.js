@@ -121,7 +121,7 @@ async function api(req, res, route, query) {
     if (!uid) return fail(res, 401, "permission-denied", "Sign in first.");
     const since = Math.max(0, Number(query.get("since")) || 0);
     const docs = Object.fromEntries(Object.entries(data.docs).filter(([p]) => data.vers[p] > since && canRead(uid, p)));
-    return json(res, 200, { ver: data.seq, docs });
+    return json(res, 200, { uid, ver: data.seq, docs });
   }
   if (req.method !== "POST") return fail(res, 404, "not-found", "No such endpoint.");
   if (!(req.headers["content-type"] || "").startsWith("application/json")) return fail(res, 415, "invalid-argument", "Send JSON.");

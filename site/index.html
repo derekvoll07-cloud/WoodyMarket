@@ -954,6 +954,9 @@ async function apiPlatform(){
   let ver=0, pulling=null, again=false, timer=null;
   const fetchChanges = async()=>{
     const r = await api("sync?since="+ver);
+    // A browser holds one sign-in at a time. If another tab signed in as someone else,
+    // this tab is now acting as them, so reload it to show who's really signed in.
+    if (r.uid && r.uid!==me.uid){ location.reload(); return; }
     const changed = Object.keys(r.docs);
     for (const p of changed) docs.set(p, r.docs[p]);
     ver = r.ver;
