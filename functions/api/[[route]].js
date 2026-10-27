@@ -1,5 +1,5 @@
 // Woody Polymarket — Cloudflare Pages Function serving /api/*.
-// Accounts, sessions and every document live in a D1 database bound as DB.
+// Accounts, sessions and every document live in a D1 database bound to the project (normally as DB).
 // Same API and permissions as server.js (the local test server).
 // Owner: the OWNER_USERNAME environment variable, else "derekv".
 
@@ -91,9 +91,12 @@ async function allowed(db, c, p, prev, next) {
 }
 
 // ---------- api ----------
+// The D1 binding is normally named DB, but any single D1 binding works.
+const findDb = env => env.DB || Object.values(env).find(v => v && typeof v.prepare === "function" && typeof v.batch === "function");
+
 export async function onRequest({ request, env, params }) {
-  const db = env.DB;
-  if (!db) return fail(500, "not-configured", "No D1 database is bound as DB. See the README.");
+  const db = findDb(env);
+  if (!db) return fail(500, "not-configured", "No D1 database is bound to this Pages project. See the README.");
   await ensureSchema(db);
   const owner = (env.OWNER_USERNAME || "derekv").toLowerCase();
   const route = [].concat(params.route || []).join("/");
