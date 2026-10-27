@@ -6,11 +6,11 @@
 window.WOODY_FIREBASE = {
   ownerUsername: "derekv",
   firebaseConfig: {
-    apiKey: "PASTE_HERE",
-    authDomain: "PASTE_HERE",
-    projectId: "PASTE_HERE",
-    storageBucket: "PASTE_HERE",
-    messagingSenderId: "PASTE_HERE",
-    appId: "PASTE_HERE"
+    apiKey: "AIzaSyBxUhPWpo7ZvKkgI3r1EINisUmyR7d5tD4",
+    authDomain: "woody-polymarket.firebaseapp.com",
+    projectId: "woody-polymarket",
+    storageBucket: "woody-polymarket.firebasestorage.app",
+    messagingSenderId: "638527154727",
+    appId: "1:638527154727:web:ce03574d78c43d95203c02"
   }
 };
