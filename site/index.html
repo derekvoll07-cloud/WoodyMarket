@@ -1,0 +1,1056 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Woody Polymarket</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<meta name="theme-color" content="#0441B4">
+<link rel="icon" type="image/png" href="img/logo-64.png">
+<link rel="apple-touch-icon" href="img/logo-192.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Outfit:wght@500;700;800&family=Atkinson+Hyperlegible:wght@400;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="css/style.css">
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script src="config.js"></script>
+</head>
+<body>
+
+<header class="top">
+  <div class="wrap">
+    <div class="bar">
+      <a class="brand" href="#markets" id="brand"><img class="brand-logo" src="img/logo-192.png" alt=""><b>Woody Polymarket</b></a>
+      <div class="wallet" id="wallet" title="Your credits. Credits are play money and can't be cashed out.">
+        <img class="avatar" id="me-avatar" alt="" hidden>
+        <div><small>Credits</small><div class="num" id="me-balance">—</div></div>
+      </div>
+      <div id="auth-slot" hidden></div>
+    </div>
+    <nav class="tabs" id="tabs" aria-label="Sections">
+      <button data-view="markets">Markets</button>
+      <button data-view="create">Create market</button>
+      <button data-view="mine">My bets</button>
+      <button data-view="leaders">Leaderboard</button>
+      <button data-view="mod" id="tab-mod" hidden>Admin</button>
+      <button data-view="rules">How it works</button>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap" id="main">
+  <div class="empty"><img class="empty-logo" src="img/logo-192.png" alt=""><h3>Loading the markets…</h3><p>Connecting to the shared board.</p></div>
+</main>
+
+<footer class="site">
+  <div class="wrap"><img src="img/logo-64.png" alt=""><span>Woody Polymarket · Play credits only. Nothing here can be bought or cashed out.</span></div>
+</footer>
+
+<script>
+(() => {
+"use strict";
+// ---------- constants ----------
+const FLAG_WORDS = ["pregnan","baby","babies","birth","born","die ","dies","died","death","dead","funeral","sick","cancer","illness","hospital","leave","leaves","leaving","left the","quit","expel","excommunic","kicked out","engage","marry","marri","wedding","divorce","dating","girlfriend","boyfriend","crush","kid","child","teen","son ","daughter","his ","her ","he ","she "];
+const DISPUTE_HOURS = 48;
+const HOUSE = "house";
+
+// ---------- state ----------
+const S = {
+  db:null, user:null, uid:null, isAdmin:false, isOwner:false, mods:[], canWrite:null, platform:null,
+  markets:new Map(), books:new Map(), config:{requireApproval:true, startBalance:10000, topUp:250},
+  loaded:{markets:false, books:false},
+  view:"markets", marketId:null, filterStatus:"open",
+  side:"YES", writeQ:Promise.resolve(), readOnlyReason:null,
+  members:new Map(), myMember:null, myName:"", unsubs:[], gated:false
+};
+const $ = (s, r=document) => r.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const fmt = (n, d=0) => (Math.round(n * 10**d) / 10**d).toLocaleString(undefined,{minimumFractionDigits:d,maximumFractionDigits:d});
+const pct = p => Math.round(p*100);
+const now = () => Date.now();
+const uidMint = () => Math.random().toString(36).slice(2,10) + now().toString(36);
+
+// ---------- CPMM (weighted constant product, Manifold-style) ----------
+const clampP = p => Math.min(0.98, Math.max(0.02, p));
+function probOf(pool, p){ const a=p*pool.n, b=(1-p)*pool.y; return a/(a+b); }
+function lnk(pool,p){ return p*Math.log(pool.y) + (1-p)*Math.log(pool.n); }
+function quoteBuy(pool, p, side, M){
+  const L = lnk(pool,p);
+  if (side==="YES"){ const n1=pool.n+M, y1=pool.y+M; const y2=Math.exp((L-(1-p)*Math.log(n1))/p); return {shares:y1-y2, pool:{y:y2,n:n1}}; }
+  const y1=pool.y+M, n1=pool.n+M; const n2=Math.exp((L-p*Math.log(y1))/(1-p)); return {shares:n1-n2, pool:{y:y1,n:n2}};
+}
+function quoteSell(pool, p, side, s){
+  const L = lnk(pool,p);
+  const f = side==="YES" ? M => p*Math.log(pool.y+s-M)+(1-p)*Math.log(pool.n-M)-L
+                         : M => p*Math.log(pool.y-M)+(1-p)*Math.log(pool.n+s-M)-L;
+  let lo=0, hi=(side==="YES" ? Math.min(pool.y+s, pool.n) : Math.min(pool.y, pool.n+s)) * (1-1e-9);
+  for (let i=0;i<80;i++){ const mid=(lo+hi)/2; if (f(mid)>0) lo=mid; else hi=mid; }
+  const M=lo;
+  const np = side==="YES" ? {y:pool.y+s-M, n:pool.n-M} : {y:pool.y-M, n:pool.n+s-M};
+  return {credits:M, pool:np};
+}
+
+// ---------- derived data ----------
+function allTrades(){
+  const out=[];
+  for (const [uid,b] of S.books) for (const t of (b.trades||[])) out.push({...t, uid});
+  return out.sort((a,b)=>a.ts-b.ts || String(a.id).localeCompare(String(b.id)));
+}
+function marketState(m){
+  let pool={y:m.L, n:m.L};
+  const hist=[{ts:m.createdAt, p:m.p}], trades=[], pos=new Map();
+  let volume=0;
+  for (const t of S._trades || []){
+    if (t.m!==m.id) continue;
+    if (t.type==="buy"){
+      if (t.side==="YES") pool={y:pool.y+t.amt-t.shares, n:pool.n+t.amt}; else pool={y:pool.y+t.amt, n:pool.n+t.amt-t.shares};
+    } else {
+      if (t.side==="YES") pool={y:pool.y+t.shares-t.amt, n:pool.n-t.amt}; else pool={y:pool.y-t.amt, n:pool.n+t.shares-t.amt};
+    }
+    if (pool.y<=0 || pool.n<=0) pool={y:Math.max(pool.y,1e-6), n:Math.max(pool.n,1e-6)};
+    volume+=t.amt;
+    const p=probOf(pool,m.p);
+    hist.push({ts:t.ts,p}); trades.push({...t, after:p});
+    const ps=pos.get(t.uid)||{yes:0,no:0,net:0};
+    const sgn = t.type==="buy"?1:-1;
+    if (t.side==="YES") ps.yes+=sgn*t.shares; else ps.no+=sgn*t.shares;
+    ps.net += sgn*t.amt;
+    pos.set(t.uid,ps);
+  }
+  return {pool, prob:probOf(pool,m.p), hist, trades, pos, volume};
+}
+function status(m){
+  if (m.status==="resolved") return "resolved";
+  if (m.status==="rejected") return "rejected";
+  if (m.status==="pending") return "pending";
+  return now() >= m.closeAt ? "closed" : "open";
+}
+function recompute(){
+  S._trades = allTrades();
+  S._ms = new Map();
+  for (const m of S.markets.values()) S._ms.set(m.id, marketState(m));
+}
+function balanceOf(uid){
+  const book=S.books.get(uid)||{};
+  let bal = S.config.startBalance;
+  for (const g of (book.grants||[])) bal+=g.amt;
+  for (const t of (book.trades||[])) bal += t.type==="buy" ? -t.amt : t.amt;
+  for (const m of S.markets.values()){
+    const ms=S._ms.get(m.id); if (!ms) continue;
+    if (m.creator===uid && m.status!=="rejected") bal -= m.L;
+    if (m.status==="rejected" && m.creator===uid) {/* never charged */}
+    if (m.status==="resolved"){
+      const o=m.resolution?.outcome;
+      const ps=ms.pos.get(uid);
+      if (o==="NA"){ if (ps) bal+=ps.net; if (m.creator===uid) bal+=m.L; }
+      else {
+        if (ps) bal += o==="YES" ? ps.yes : ps.no;
+        if (m.creator===uid) bal += o==="YES" ? ms.pool.y : ms.pool.n;
+      }
+    }
+  }
+  return bal;
+}
+function netWorth(uid){
+  let w=balanceOf(uid);
+  for (const m of S.markets.values()){
+    if (m.status==="resolved"||m.status==="rejected") continue;
+    const ms=S._ms.get(m.id); const ps=ms?.pos.get(uid);
+    if (ps) w += ps.yes*ms.prob + ps.no*(1-ms.prob);
+    if (m.creator===uid && m.status!=="pending") w += ms.pool.y*ms.prob + ms.pool.n*(1-ms.prob);
+    else if (m.creator===uid) w += m.L;
+  }
+  return w;
+}
+function myBook(){ return S.books.get(S.uid) || {trades:[],grants:[],comments:[],disputes:[]}; }
+function allDisputes(){
+  const out=[];
+  for (const [uid,b] of S.books) for (const d of (b.disputes||[])) out.push({...d, uid});
+  return out.sort((a,b)=>b.ts-a.ts);
+}
+function allComments(mid){
+  const out=[];
+  for (const [uid,b] of S.books) for (const c of (b.comments||[])) if (c.m===mid) out.push({...c, uid});
+  return out.sort((a,b)=>a.ts-b.ts);
+}
+function flagWords(text){
+  const t=" "+text.toLowerCase()+" ";
+  return [...new Set(FLAG_WORDS.filter(w=>t.includes(w)).map(w=>w.trim()))];
+}
+function timeLeft(ts){
+  const d=ts-now(); const a=Math.abs(d);
+  const u = a<36e5 ? `${Math.max(1,Math.round(a/6e4))} min` : a<864e5*2 ? `${Math.round(a/36e5)} hr` : `${Math.round(a/864e5)} days`;
+  return d>0 ? `closes in ${u}` : `closed ${u} ago`;
+}
+const dateStr = ts => new Date(ts).toLocaleDateString(undefined,{day:"numeric",month:"short",year:"numeric"});
+const dtStr = ts => new Date(ts).toLocaleString(undefined,{day:"numeric",month:"short",hour:"numeric",minute:"2-digit"});
+
+// ---------- names ----------
+function who(uid, withAvatar=true){
+  if (uid===HOUSE) return `<span class="who">${withAvatar?'<img src="img/logo-64.png" alt="">':''}<span>Woody House</span></span>`;
+  return `<span class="who" data-uid="${esc(uid)}">${withAvatar?'<img alt="">':''}<span>${uid===S.uid?"You":"…"}</span></span>`;
+}
+async function hydrateNames(root=document){
+  if (!S.user) { root.querySelectorAll("[data-uid] span").forEach(s=>{ if (s.textContent==="…") s.textContent="Player"; }); return; }
+  const els=[...root.querySelectorAll("[data-uid]")]; if (!els.length) return;
+  const ids=[...new Set(els.map(e=>e.dataset.uid))];
+  const ps=await S.user.profiles(ids);
+  for (const e of els){
+    const p=ps[e.dataset.uid]; if (!p) continue;
+    const img=e.querySelector("img"); if (img) img.src=p.avatarUrl;
+    const span=e.querySelector("span");
+    span.textContent = p.isMe ? `${p.name||"You"} (you)` : (p.name || "Player " + e.dataset.uid.slice(-4));
+  }
+}
+
+// ---------- writing ----------
+function canAct(){ return S.db && S.uid && S.canWrite!==false; }
+function saveMine(mutate){
+  const run = async () => {
+    const cur = structuredClone(myBook());
+    cur.trades ||= []; cur.grants ||= []; cur.comments ||= []; cur.disputes ||= [];
+    cur.joinedAt ||= now();
+    const res = mutate(cur);
+    if (res===false) return false;
+    await S.db.doc("bets/"+S.uid).set(cur);
+    S.books.set(S.uid, cur); recompute(); refresh();
+    return true;
+  };
+  const p = S.writeQ.then(run);
+  S.writeQ = p.catch(()=>{});
+  return p;
+}
+function writeErr(e){
+  if (e?.code==="permission-denied") return "You don't have permission to do that.";
+  if (e?.code==="invalid_argument") { S.canWrite=false; renderBanner(); return "You don't have permission to make changes here. Ask the owner to invite you as an Editor."; }
+  if (e?.code==="quota_exceeded") return "The board is full. Ask the owner to clear out old markets.";
+  return "That didn't save. Check your connection and try again.";
+}
+
+// ---------- rendering ----------
+const main = $("#main");
+function setView(v, id=null, push=true){
+  S.view=v; S.marketId=id;
+  if (push){ try{ history.replaceState(null,"", v==="market" ? "#m-"+id : "#"+v); }catch{} }
+  document.querySelectorAll("#tabs button").forEach(b=>b.setAttribute("aria-current", b.dataset.view===v ? "page":"false"));
+  render(true);
+  window.scrollTo({top:0});
+}
+function render(full){
+  updateWallet();
+  updateModTab();
+  if (!S.loaded.markets){ return; }
+  const v=S.view;
+  if (v==="market") return full ? renderDetail() : refreshDetail();
+  if (v==="create") { if (full) renderCreate(); else updateCreateHints(); return; }
+  const a=document.activeElement;
+  if (!full && a && main.contains(a) && /INPUT|TEXTAREA|SELECT/.test(a.tagName)) { S._dirty=true; return; }
+  if (v==="markets") renderList();
+  else if (v==="mine") renderMine();
+  else if (v==="leaders") renderLeaders();
+  else if (v==="mod") renderMod();
+  else if (v==="rules") renderRules();
+}
+function refresh(){ render(false); }
+main.addEventListener("focusout", ()=>{ if (S._dirty){ S._dirty=false; setTimeout(()=>{ const a=document.activeElement; if (!(a && main.contains(a) && /INPUT|TEXTAREA|SELECT/.test(a.tagName))) render(false); },0);} });
+
+function updateWallet(){
+  const el=$("#me-balance");
+  if (!S.uid){ el.textContent = S.loaded.books ? "Sign in" : "—"; return; }
+  el.textContent = S._ms ? fmt(balanceOf(S.uid)) : "—";
+}
+function updateModTab(){
+  const t=$("#tab-mod"); t.hidden=!S.isAdmin;
+  if (!S.isAdmin) return;
+  const n=[...S.markets.values()].filter(m=>m.status==="pending").length + openDisputes().length + membersBy("pending").length;
+  t.innerHTML = "Admin" + (n?`<span class="count">${n}</span>`:"");
+}
+function renderBanner(){
+  const old=$("#ro-banner"); if (old) old.remove();
+  if (S.canWrite!==false && S.uid) return;
+  const b=document.createElement("div"); b.className="banner"; b.id="ro-banner";
+  b.innerHTML = !S.uid
+    ? `<div><b>Browsing only.</b> Sign in to claude.ai to get credits and place bets.</div>`
+    : `<div><b>Browsing only.</b> You can see every market, but betting needs edit access. Ask the board's owner to invite you as an Editor.</div>`;
+  main.prepend(b);
+}
+function statusPill(m){
+  const s=status(m);
+  if (s==="resolved"){ const o=m.resolution?.outcome; return `<span class="pill ${o==="YES"?"yes":o==="NO"?"no":""}">Resolved ${o==="NA"?"N/A":o}</span>`; }
+  const label={open:"Open",closed:"Awaiting result",pending:"In review",rejected:"Rejected"}[s];
+  return `<span class="pill ${s==="open"?"open":s==="pending"?"pending":""}">${label}</span>`;
+}
+
+// list
+function renderList(){
+  const ms=[...S.markets.values()].filter(m=>m.status!=="rejected");
+  const filt = ms.filter(m=>{
+    const s=status(m);
+    if (S.filterStatus==="open" && s!=="open") return false;
+    if (S.filterStatus==="closed" && !(s==="closed"||s==="resolved")) return false;
+    if (S.filterStatus==="review" && s!=="pending") return false;
+    return true;
+  }).sort((a,b)=>(S._ms.get(b.id).volume - S._ms.get(a.id).volume) || (b.createdAt-a.createdAt));
+  const statuses=[["open","Open"],["closed","Closed & resolved"],["review","In review"],["all","All"]];
+  main.innerHTML = `
+    <section class="hero">
+      <img class="hero-logo" src="img/logo-512.png" alt="">
+      <div>
+        <p class="eyebrow">Woody Polymarket</p>
+        <h1>What happens next on the hof?</h1>
+        <p class="lead">Bet play credits on public, checkable events. Odds move as people trade.</p>
+        <div class="hero-actions"><button class="btn light" data-go="create">+ New market</button><button class="btn outline-light" data-go="rules">How it works</button></div>
+      </div>
+    </section>
+    <div class="chips" role="group" aria-label="Status" style="margin-bottom:18px">${statuses.map(([k,l])=>`<button class="chip" data-status="${k}" aria-pressed="${S.filterStatus===k}">${l}</button>`).join("")}</div>
+    ${filt.length ? `<div class="grid">${filt.map(cardHTML).join("")}</div>`
+      : `<div class="empty"><h3>${ms.length?"Nothing matches these filters":"No markets yet"}</h3><p>${ms.length?"Try another status.":"Be the first: describe a public event and set the starting odds."}</p><div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-top:8px"><button class="btn primary" data-go="create">Create a market</button>${S.isAdmin&&!ms.length?`<button class="btn" id="seed">Add 6 example markets</button>`:""}</div></div>`}`;
+  renderBanner();
+}
+function cardHTML(m){
+  const ms=S._ms.get(m.id), p=ms.prob;
+  return `<button class="card" data-market="${esc(m.id)}">
+    <div class="meta">${statusPill(m)}</div>
+    <h3>${esc(m.q)}</h3>
+    <div class="row"><div class="prob num">${pct(p)}%<small>YES</small></div><div class="meter" aria-hidden="true"><i style="width:${pct(p)}%"></i></div></div>
+    <div class="foot"><span class="num">${fmt(ms.volume)} cr traded</span><span>${status(m)==="resolved"?"Resolved "+dateStr(m.resolution.at):timeLeft(m.closeAt)}</span></div>
+  </button>`;
+}
+
+// chart
+function chartSVG(m, ms){
+  const W=640,H=200,pl=34,pr=14,pt=12,pb=26;
+  const end = status(m)==="open" ? now() : Math.min(now(), m.status==="resolved" ? m.resolution.at : m.closeAt);
+  const t0=m.createdAt, t1=Math.max(end, t0+1);
+  const X=t=>pl+(t-t0)/(t1-t0)*(W-pl-pr), Y=p=>pt+(1-p)*(H-pt-pb);
+  const pts=[]; let last=ms.hist[0].p;
+  for (const h of ms.hist){ pts.push([X(h.ts),Y(last)]); pts.push([X(h.ts),Y(h.p)]); last=h.p; }
+  pts.push([X(t1),Y(last)]);
+  const line=pts.map((q,i)=>(i?"L":"M")+q[0].toFixed(1)+" "+q[1].toFixed(1)).join(" ");
+  const area=line+` L${X(t1).toFixed(1)} ${Y(0)} L${X(t0).toFixed(1)} ${Y(0)} Z`;
+  const grid=[0,.25,.5,.75,1].map(g=>`<line x1="${pl}" x2="${W-pr}" y1="${Y(g)}" y2="${Y(g)}" stroke="var(--line)" stroke-width="1"/><text x="${pl-6}" y="${Y(g)+4}" text-anchor="end" font-size="11" fill="var(--muted)" font-family="var(--f-mono)">${g*100}%</text>`).join("");
+  const lx=X(t1), ly=Y(last);
+  return `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Chance of YES over time, now ${pct(last)}%">
+    ${grid}
+    <path d="${area}" fill="var(--yes)" fill-opacity=".12"/>
+    <path d="${line}" fill="none" stroke="var(--yes)" stroke-width="2.2" stroke-linejoin="round"/>
+    <circle cx="${lx}" cy="${ly}" r="4.5" fill="var(--yes)" stroke="var(--surface)" stroke-width="2"/>
+    <text x="${pl}" y="${H-6}" font-size="11" fill="var(--muted)">${esc(dateStr(t0))}</text>
+    <text x="${W-pr}" y="${H-6}" font-size="11" fill="var(--muted)" text-anchor="end">${status(m)==="open"?"now":esc(dateStr(t1))}</text>
+  </svg>`;
+}
+
+// detail
+function renderDetail(){
+  const m=S.markets.get(S.marketId);
+  if (!m){ main.innerHTML=`<button class="back" data-go="markets">← All markets</button><div class="empty"><h3>This market isn't here</h3><p>It may have been removed.</p></div>`; return; }
+  main.innerHTML = `
+    <button class="back" data-go="markets">← All markets</button>
+    <div class="detail">
+      <div class="stack">
+        <div>
+          <div class="chips" id="d-pills"></div>
+          <h1>${esc(m.q)}</h1>
+          <div class="stats" id="d-stats"></div>
+        </div>
+        <div class="panel chart" id="d-chart"></div>
+        <div class="panel" id="d-resolve-wrap" hidden></div>
+        <div class="panel">
+          <p class="sectitle">How this resolves</p>
+          <dl class="kv">
+            <dt>Resolves YES if</dt><dd>${esc(m.criteria)}</dd>
+            ${m.source?`<dt>Checked against</dt><dd>${/^https?:\/\//i.test(m.source)?`<a href="${esc(m.source)}" target="_blank" rel="noopener">${esc(m.source)}</a>`:esc(m.source)}</dd>`:""}
+            <dt>Closes</dt><dd>${esc(new Date(m.closeAt).toLocaleString())}</dd>
+            <dt>Created by</dt><dd>${who(m.creator)} · ${esc(dateStr(m.createdAt))}</dd>
+            <dt>Starting odds</dt><dd class="num">${pct(m.p)}% YES · ${fmt(m.L)} cr liquidity</dd>
+          </dl>
+          ${m.desc?`<p style="margin:14px 0 0;white-space:pre-wrap">${esc(m.desc)}</p>`:""}
+        </div>
+        <div class="panel"><p class="sectitle">Recent trades</p><div class="scroll" id="d-activity"></div></div>
+        <div class="panel"><p class="sectitle">Discussion</p><div id="d-comments"></div>
+          <form id="f-comment" class="stack" style="gap:8px;margin-top:10px">
+            <label class="field"><span class="sr" hidden>Comment</span><textarea id="c-text" maxlength="600" placeholder="Share evidence or reasoning…"></textarea></label>
+            <div><button class="btn small" type="submit">Post comment</button><span class="msg" id="c-msg"></span></div>
+          </form>
+        </div>
+      </div>
+      <aside class="stack ticket">
+        <div class="panel" id="d-ticket"></div>
+        <div class="panel" id="d-pos"></div>
+      </aside>
+    </div>`;
+  renderBanner();
+  buildTicket();
+  refreshDetail();
+}
+function refreshDetail(){
+  const m=S.markets.get(S.marketId); if (!m) return renderDetail();
+  const ms=S._ms.get(m.id), s=status(m);
+  $("#d-pills").innerHTML = `${statusPill(m)}${(m.flags||[]).length&&S.isAdmin?`<span class="pill flag">Flagged: ${esc(m.flags.join(", "))}</span>`:""}`;
+  $("#d-stats").innerHTML = `
+    <div class="stat"><label>Chance of YES</label><div class="prob num" style="font-size:44px">${pct(ms.prob)}%</div></div>
+    <div class="stat"><label>Traded</label><div class="v num">${fmt(ms.volume)} cr</div></div>
+    <div class="stat"><label>Traders</label><div class="v num">${ms.pos.size}</div></div>
+    <div class="stat"><label>${s==="open"?"Closes":"Closed"}</label><div class="v">${esc(timeLeft(m.closeAt))}</div></div>`;
+  $("#d-chart").innerHTML = chartSVG(m, ms);
+  // activity
+  const tr=[...ms.trades].reverse().slice(0,25);
+  $("#d-activity").innerHTML = tr.length ? `<table class="t"><thead><tr><th>Who</th><th>Trade</th><th class="r">Credits</th><th class="r">Odds after</th><th class="r">When</th></tr></thead><tbody>${tr.map(t=>`<tr><td>${who(t.uid)}</td><td>${t.type==="buy"?"Bought":"Sold"} <b style="color:var(--${t.side==="YES"?"yes":"no"})">${t.side}</b></td><td class="r num">${fmt(t.amt)}</td><td class="r num">${pct(t.after)}%</td><td class="r small muted">${esc(dtStr(t.ts))}</td></tr>`).join("")}</tbody></table>` : `<p class="muted" style="margin:0">No trades yet. The first bet moves the odds most.</p>`;
+  // comments
+  const cs=allComments(m.id);
+  $("#d-comments").innerHTML = cs.length ? cs.map(c=>`<div class="comment"><div style="min-width:0"><div class="small">${who(c.uid)} <span class="muted">· ${esc(dtStr(c.ts))}</span></div><p>${esc(c.text)}</p></div></div>`).join("") : `<p class="muted" style="margin:0">No comments yet.</p>`;
+  // position
+  const ps=ms.pos.get(S.uid);
+  const pos=$("#d-pos");
+  if (ps && (ps.yes>1e-6||ps.no>1e-6) && s!=="resolved"){
+    const rows=[]; for (const side of ["YES","NO"]){ const sh=side==="YES"?ps.yes:ps.no; if (sh<1e-6) continue;
+      const q=quoteSell(ms.pool,m.p,side,sh);
+      rows.push(`<div class="quote" style="border-top:0;margin-top:0;padding-top:0"><dt><b style="color:var(--${side==="YES"?"yes":"no"})">${side}</b> shares</dt><dd class="num">${fmt(sh,1)}</dd><dt>Pays if ${side}</dt><dd class="num">${fmt(sh)} cr</dd><dt>Sell now for</dt><dd class="num">${fmt(q.credits)} cr</dd></div>
+        ${s==="open"&&canAct()?`<button class="btn small" data-sell="${side}" style="margin:6px 0 12px">Sell all ${side}</button>`:""}`); }
+    pos.innerHTML = `<p class="sectitle">Your position</p>${rows.join("")}<div class="msg" id="sell-msg"></div>`;
+  } else if (ps && s==="resolved"){
+    const o=m.resolution.outcome; const got = o==="NA" ? ps.net : (o==="YES"?ps.yes:ps.no);
+    pos.innerHTML = `<p class="sectitle">Your result</p><p style="margin:0">You put in <b class="num">${fmt(ps.net)}</b> cr and got back <b class="num">${fmt(got)}</b> cr. ${got-ps.net>=0?`<span style="color:var(--accent)">+${fmt(got-ps.net)}</span>`:`<span style="color:var(--no)">${fmt(got-ps.net)}</span>`}</p>`;
+  } else pos.innerHTML = `<p class="sectitle">Your position</p><p class="muted" style="margin:0">You haven't bet on this market.</p>`;
+  if (S._ticketOpen !== (s==="open")) buildTicket();
+  refreshTicket();
+  const rw=$("#d-resolve-wrap"), a=document.activeElement;
+  if (!(a && rw.contains(a) && /INPUT|TEXTAREA/.test(a.tagName)) && !rw.querySelector("details[open]")) renderResolve(m, ms);
+  hydrateNames(main);
+}
+function buildTicket(){
+  const m=S.markets.get(S.marketId); const s=status(m);
+  const t=$("#d-ticket"); S._ticketOpen = s==="open";
+  if (s!=="open"){
+    t.innerHTML = `<p class="sectitle">Trading</p><p style="margin:0">${s==="pending"?"This market is waiting for a moderator to approve it.":s==="rejected"?"This market was rejected"+(m.rejectReason?": "+esc(m.rejectReason):"."):s==="closed"?"Trading has closed. Waiting for the creator to report the result.":"This market is settled."}</p>`;
+    return;
+  }
+  t.innerHTML = `
+    <p class="sectitle">Place a bet</p>
+    <div class="seg" role="group" aria-label="Side"><button class="y" data-side="YES" aria-pressed="${S.side==="YES"}">YES <span class="num" id="t-py"></span></button><button class="n" data-side="NO" aria-pressed="${S.side==="NO"}">NO <span class="num" id="t-pn"></span></button></div>
+    <label class="field"><span>Amount (credits)</span><input type="number" id="t-amt" min="1" step="1" value="50" inputmode="numeric"></label>
+    <div class="chips" style="margin-top:8px">${[10,50,100,250].map(v=>`<button class="chip" type="button" data-amt="${v}">${v}</button>`).join("")}<button class="chip" type="button" data-amt="max">Max</button></div>
+    <dl class="quote" id="t-quote"></dl>
+    <button class="btn" id="t-buy" style="width:100%;margin-top:12px">Buy</button>
+    <div class="msg" id="t-msg"></div>`;
+  $("#t-amt").addEventListener("input", refreshTicket);
+}
+function refreshTicket(){
+  const m=S.markets.get(S.marketId); if (!m || status(m)!=="open" || !$("#t-amt")) return;
+  const ms=S._ms.get(m.id);
+  $("#t-py").textContent = pct(ms.prob)+"%"; $("#t-pn").textContent = (100-pct(ms.prob))+"%";
+  document.querySelectorAll("#d-ticket [data-side]").forEach(b=>b.setAttribute("aria-pressed", b.dataset.side===S.side));
+  const M=Math.floor(Number($("#t-amt").value)||0);
+  const btn=$("#t-buy"); btn.className="btn "+(S.side==="YES"?"yes":"no");
+  const bal=S.uid?balanceOf(S.uid):0;
+  if (M<1){ $("#t-quote").innerHTML=`<dt>Enter an amount</dt><dd></dd>`; btn.disabled=true; btn.textContent="Buy "+S.side; return; }
+  const q=quoteBuy(ms.pool,m.p,S.side,M), np=probOf(q.pool,m.p);
+  $("#t-quote").innerHTML = `<dt>Shares</dt><dd class="num">${fmt(q.shares,1)}</dd><dt>Avg price</dt><dd class="num">${fmt(M/q.shares,2)} cr/share</dd><dt>Odds after</dt><dd class="num">${pct(ms.prob)}% → ${pct(np)}%</dd><dt>Pays if ${S.side}</dt><dd class="num"><b>${fmt(q.shares)} cr</b> (+${fmt(q.shares-M)})</dd>`;
+  btn.textContent = `Buy ${S.side} for ${fmt(M)} cr`;
+  btn.disabled = !canAct() || M>bal+1e-9;
+  if (canAct() && M>bal+1e-9) $("#t-msg").textContent=`You have ${fmt(bal)} cr.`; else if ($("#t-msg").className==="msg") $("#t-msg").textContent="";
+}
+function renderResolve(m, ms){
+  const w=$("#d-resolve-wrap"); const s=status(m);
+  const isCreator = m.creator===S.uid;
+  const canResolve = canAct() && ((isCreator && s==="closed") || (S.isAdmin && (s==="open"||s==="closed")));
+  if (s==="resolved"){
+    const r=m.resolution; const age=(now()-r.at)/36e5;
+    const myDisp = myBook().disputes.find(d=>d.m===m.id && d.ts>r.at);
+    w.hidden=false;
+    w.innerHTML = `<p class="sectitle">Result</p>
+      <p style="margin:0 0 6px;font-size:18px"><b style="color:var(--${r.outcome==="YES"?"yes":r.outcome==="NO"?"no":"muted"})">${r.outcome==="NA"?"N/A (everyone refunded)":r.outcome}</b> <span class="muted small">· reported by ${who(r.by,false)} on ${esc(dtStr(r.at))}</span></p>
+      ${r.note?`<p style="margin:0 0 8px;white-space:pre-wrap">${esc(r.note)}</p>`:""}
+      ${age<DISPUTE_HOURS ? (myDisp ? `<p class="small muted" style="margin:0">You disputed this result. A moderator will review it.</p>`
+        : canAct() ? `<details><summary class="small" style="cursor:pointer">Think this is wrong? Dispute it (open for ${Math.ceil(DISPUTE_HOURS-age)} more hours)</summary>
+          <form id="f-dispute" class="stack" style="gap:8px;margin-top:8px"><textarea id="dp-text" maxlength="500" placeholder="What does the source actually show?" required></textarea><div><button class="btn small" type="submit">Send dispute</button><span class="msg" id="dp-msg"></span></div></form></details>` : "")
+        : `<p class="small muted" style="margin:0">Dispute window closed.</p>`}
+      ${S.isAdmin && canAct() ? `<details style="margin-top:10px"><summary class="small" style="cursor:pointer">Moderator: change result</summary>${resolveForm(true)}</details>`:""}`;
+    hydrateNames(w);
+    return;
+  }
+  if (!canResolve){ w.hidden=true; w.innerHTML=""; return; }
+  w.hidden=false;
+  w.innerHTML = `<p class="sectitle">${isCreator?"Report the result":"Moderator: resolve this market"}</p>
+    <p class="small muted" style="margin:0 0 10px">Check what happened against the resolution criteria below, then pick the outcome. Everyone sees what you choose and can dispute it for ${DISPUTE_HOURS} hours.</p>${resolveForm(false)}`;
+}
+function resolveForm(change){
+  return `<form id="f-resolve" class="stack" style="gap:10px;margin-top:8px">
+    <div class="chips" role="radiogroup" aria-label="Outcome">${["YES","NO","NA"].map(o=>`<label class="chip"><input type="radio" name="outcome" value="${o}" ${o==="YES"?"checked":""}> ${o==="NA"?"N/A (refund)":o}</label>`).join("")}</div>
+    <label class="field"><span>Evidence</span><textarea id="r-note" maxlength="500" placeholder="Link or a short note on what the source shows" required></textarea></label>
+    <div><button class="btn primary small" type="submit">${change?"Change result":"Resolve market"}</button><span class="msg" id="r-msg"></span></div></form>`;
+}
+
+// create
+function renderCreate(){
+  const dflt=new Date(now()+30*864e5); dflt.setMinutes(0,0,0);
+  const local=new Date(dflt.getTime()-dflt.getTimezoneOffset()*6e4).toISOString().slice(0,16);
+  main.innerHTML = `
+    <div class="listhead"><div><h1>Create a market</h1><p class="muted" style="margin:6px 0 0">Ask a yes/no question about something that will happen in public and that anyone can check.</p></div></div>
+    <form class="form" id="f-create" novalidate>
+      <div class="panel stack">
+        <label class="field"><span>Question</span><input type="text" id="c-q" maxlength="140" placeholder="Will Danthonia hold a public open day before 31 March 2027?" required></label>
+        <label class="field"><span>Resolves YES if… <span class="hint">Be exact. Name dates and numbers.</span></span><textarea id="c-crit" maxlength="500" placeholder="An open day or public farm event at Danthonia is announced on bruderhof.com or their public social pages, with a date on or before 31 Mar 2027." required></textarea></label>
+        <label class="field"><span>Background <span class="hint">Optional</span></span><textarea id="c-desc" maxlength="1000" placeholder="Any context that helps people bet sensibly."></textarea></label>
+        <label class="field"><span>Trading closes</span><input type="datetime-local" id="c-close" value="${local}" required></label>
+        <div class="two">
+          <label class="field"><span>Starting chance of YES: <b class="num" id="c-pv">50%</b></span><input type="range" id="c-p" min="2" max="98" value="50"><span class="hint">Your honest guess. Traders move it from here.</span></label>
+          <label class="field"><span>Liquidity (credits)</span><input type="number" id="c-L" min="50" step="10" value="200"><span class="hint">Paid from your credits. More liquidity means odds move less per bet. You get the leftover pool back when it resolves.</span></label>
+        </div>
+        <fieldset class="checks" style="border:1px solid var(--line);border-radius:8px;padding:6px 14px">
+          <legend class="small" style="font-weight:700;padding:0 4px">House rules</legend>
+          <label><input type="checkbox" id="k1"> It isn't about a named or identifiable person's private life: relationships, pregnancy, health, faith, membership, or death.</label>
+          <label><input type="checkbox" id="k2"> It doesn't involve children.</label>
+          <label><input type="checkbox" id="k3"> Anyone can check the outcome from a public source.</label>
+        </fieldset>
+        <div class="banner" id="c-flag" hidden></div>
+        <div><button class="btn primary" type="submit" id="c-submit">Submit market</button><span class="msg" id="c-msg"></span></div>
+      </div>
+      <aside class="panel preview stack" style="gap:8px">
+        <p class="sectitle" style="margin:0">Preview</p>
+        <div class="meta chips"><span class="pill open" id="pv-status">Open</span></div>
+        <h3 id="pv-q">Your question appears here</h3>
+        <div class="row" style="display:flex;gap:12px;align-items:center"><div class="prob num" id="pv-p">50%<small>YES</small></div><div class="meter"><i id="pv-m" style="width:50%"></i></div></div>
+        <p class="small muted" style="margin:0" id="pv-cost"></p>
+      </aside>
+    </form>`;
+  renderBanner();
+  ["c-q","c-crit","c-p","c-L","c-desc"].forEach(id=>$("#"+id).addEventListener("input", updateCreateHints));
+  updateCreateHints();
+}
+function updateCreateHints(){
+  if (!$("#f-create")) return;
+  const p=+$("#c-p").value, q=$("#c-q").value.trim(), L=Number($("#c-L").value)||0;
+  $("#c-pv").textContent=p+"%"; $("#pv-p").innerHTML=`${p}%<small>YES</small>`; $("#pv-m").style.width=p+"%";
+  $("#pv-q").textContent=q||"Your question appears here";
+  const bal=S.uid&&S._ms?balanceOf(S.uid):0;
+  $("#pv-cost").textContent = S.uid ? `Costs ${fmt(L)} cr. You have ${fmt(bal)} cr.` : "";
+  const fl=flagWords([q,$("#c-crit").value,$("#c-desc").value].join(" "));
+  const needReview = S.config.requireApproval || fl.length;
+  $("#pv-status").textContent = needReview ? "In review" : "Open"; $("#pv-status").className="pill "+(needReview?"pending":"open");
+  const box=$("#c-flag");
+  if (fl.length){ box.hidden=false; box.innerHTML=`<div><b>A moderator will check this one.</b> It mentions ${esc(fl.join(", "))}. Markets about specific people's personal lives get rejected.</div>`; }
+  else box.hidden=true;
+}
+
+// my bets
+function renderMine(){
+  if (!S.uid){ main.innerHTML=`<div class="empty"><h3>Sign in to see your bets</h3></div>`; return; }
+  const rows=[]; let openVal=0;
+  for (const m of S.markets.values()){
+    const ms=S._ms.get(m.id); const ps=ms.pos.get(S.uid); if (!ps) continue;
+    const s=status(m);
+    let val; if (s==="resolved"){ const o=m.resolution.outcome; val= o==="NA"?ps.net:(o==="YES"?ps.yes:ps.no); }
+    else { val=ps.yes*ms.prob+ps.no*(1-ms.prob); openVal+=val; }
+    rows.push({m,ms,ps,s,val});
+  }
+  rows.sort((a,b)=>(a.s==="resolved")-(b.s==="resolved") || b.ps.net-a.ps.net);
+  const created=[...S.markets.values()].filter(m=>m.creator===S.uid);
+  const bal=balanceOf(S.uid), nw=netWorth(S.uid);
+  const book=myBook(); const lastTop=Math.max(0,...(book.grants||[]).map(g=>g.ts));
+  const canTop = canAct() && bal<100 && now()-lastTop>864e5;
+  main.innerHTML = `
+    <div class="listhead"><h1>My bets</h1></div>
+    <div class="stats panel" style="margin-bottom:16px">
+      <div class="stat"><label>Credits</label><div class="prob num">${fmt(bal)}</div></div>
+      <div class="stat"><label>In open bets</label><div class="v num" style="font-size:20px">${fmt(openVal)}</div></div>
+      <div class="stat"><label>Net worth</label><div class="v num" style="font-size:20px">${fmt(nw)}</div></div>
+      ${canTop?`<button class="btn small" id="topup" style="margin-left:auto">Running low? Get ${S.config.topUp} free credits</button>`:""}
+    </div>
+    <div class="panel"><p class="sectitle">Positions</p>${rows.length?`<div class="scroll"><table class="t"><thead><tr><th>Market</th><th class="r">YES</th><th class="r">NO</th><th class="r">Put in</th><th class="r">Worth</th><th></th></tr></thead><tbody>${rows.map(r=>`<tr><td><a href="#m-${esc(r.m.id)}" data-market="${esc(r.m.id)}">${esc(r.m.q)}</a></td><td class="r num">${r.ps.yes>0.05?fmt(r.ps.yes,1):"–"}</td><td class="r num">${r.ps.no>0.05?fmt(r.ps.no,1):"–"}</td><td class="r num">${fmt(r.ps.net)}</td><td class="r num" style="color:var(--${r.val>=r.ps.net?"accent":"no"})">${fmt(r.val)}</td><td>${statusPill(r.m)}</td></tr>`).join("")}</tbody></table></div>`:`<p class="muted" style="margin:0">No bets yet. Pick a market and back your read.</p>`}</div>
+    <div class="panel" style="margin-top:16px"><p class="sectitle">Markets you created</p>${created.length?`<table class="t"><tbody>${created.map(m=>`<tr><td><a href="#m-${esc(m.id)}" data-market="${esc(m.id)}">${esc(m.q)}</a>${m.status==="rejected"&&m.rejectReason?`<div class="small muted">Rejected: ${esc(m.rejectReason)}</div>`:""}</td><td class="r">${statusPill(m)}</td></tr>`).join("")}</tbody></table>`:`<p class="muted" style="margin:0">None yet.</p>`}</div>`;
+  renderBanner();
+}
+
+// leaders
+function renderLeaders(){
+  const ids=new Set([...S.books.keys()]); for (const m of S.markets.values()) if (m.creator!==HOUSE) ids.add(m.creator);
+  // Players who were rejected or removed drop off the board (their past trades still count in the odds).
+  if (S.members.size) for (const u of ids) if (S.members.get(u)?.status!=="approved") ids.delete(u);
+  const rows=[...ids].map(u=>{ const b=S.books.get(u)||{}; const base=S.config.startBalance+(b.grants||[]).reduce((a,g)=>a+g.amt,0); const nw=netWorth(u); return {u,nw,profit:nw-base}; }).sort((a,b)=>b.nw-a.nw);
+  main.innerHTML = `<div class="listhead"><div><h1>Leaderboard</h1><p class="muted" style="margin:6px 0 0">Net worth counts credits plus the current value of open bets.</p></div></div>
+    <div class="panel">${rows.length?`<div class="scroll"><table class="t"><thead><tr><th>#</th><th>Player</th><th class="r">Net worth</th><th class="r">Profit</th></tr></thead><tbody>${rows.map((r,i)=>`<tr${r.u===S.uid?' style="background:var(--sunk)"':""}><td class="num">${i+1}</td><td>${who(r.u)}</td><td class="r num">${fmt(r.nw)}</td><td class="r num" style="color:var(--${r.profit>=0?"accent":"no"})">${r.profit>=0?"+":""}${fmt(r.profit)}</td></tr>`).join("")}</tbody></table></div>`:`<p class="muted" style="margin:0">Nobody has placed a bet yet.</p>`}</div>`;
+  hydrateNames(main);
+}
+
+// moderation
+function openDisputes(){
+  return allDisputes().filter(d=>{ const m=S.markets.get(d.m); return m && m.status==="resolved" && d.ts>m.resolution.at && !(m.dismissed||[]).includes(d.id); });
+}
+function renderMod(){
+  if (!S.isAdmin){ main.innerHTML=`<div class="empty"><h3>Moderators only</h3></div>`; return; }
+  const pend=[...S.markets.values()].filter(m=>m.status==="pending").sort((a,b)=>a.createdAt-b.createdAt);
+  const disp=openDisputes();
+  main.innerHTML = `
+    <div class="listhead"><div><h1>Admin</h1><p class="muted" style="margin:6px 0 0">Decide who gets in, approve new markets, settle disputes and set the house rules.</p></div></div>
+    <div class="stack">
+      ${S.platform?.kind!=="claude" ? requestsPanel() : ""}
+      <div class="panel"><p class="sectitle">Markets waiting for review (${pend.length})</p>
+        ${pend.length?pend.map(m=>`<div style="padding:12px 0;border-bottom:1px solid var(--line)">
+          ${(m.flags||[]).length?`<div class="chips" style="margin-bottom:6px"><span class="pill flag">Mentions: ${esc(m.flags.join(", "))}</span></div>`:""}
+          <b style="font-size:16px">${esc(m.q)}</b>
+          <dl class="kv small" style="margin:8px 0"><dt>YES if</dt><dd>${esc(m.criteria)}</dd>${m.source?`<dt>Source</dt><dd>${esc(m.source)}</dd>`:""}<dt>By</dt><dd>${who(m.creator)}</dd><dt>Odds</dt><dd class="num">${pct(m.p)}% · ${fmt(m.L)} cr · closes ${esc(dateStr(m.closeAt))}</dd></dl>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center"><button class="btn primary small" data-approve="${esc(m.id)}">Approve</button><input type="text" id="rr-${esc(m.id)}" placeholder="Reason for rejecting" style="flex:1;min-width:160px"><button class="btn small" data-reject="${esc(m.id)}">Reject</button></div>
+        </div>`).join(""):`<p class="muted" style="margin:0">Nothing waiting.</p>`}</div>
+      <div class="panel"><p class="sectitle">Open disputes (${disp.length})</p>
+        ${disp.length?disp.map(d=>{const m=S.markets.get(d.m);return `<div style="padding:12px 0;border-bottom:1px solid var(--line)"><a href="#m-${esc(m.id)}" data-market="${esc(m.id)}"><b>${esc(m.q)}</b></a><p class="small" style="margin:4px 0">Resolved <b>${esc(m.resolution.outcome)}</b>. ${who(d.uid)} says: ${esc(d.reason)}</p><button class="btn small" data-dismiss="${esc(m.id)}|${esc(d.id)}">Keep result</button> <button class="btn small" data-market="${esc(m.id)}">Open market to change it</button></div>`}).join(""):`<p class="muted" style="margin:0">No disputes.</p>`}</div>
+      ${S.platform?.kind!=="claude" ? playersPanel() + outPanel() : ""}
+      ${!S.isOwner ? "" : `<div class="panel"><p class="sectitle">House settings</p>
+        <form id="f-settings" class="stack" style="gap:12px;max-width:520px">
+          <label class="checks" style="display:flex;gap:10px;align-items:flex-start"><input type="checkbox" id="s-appr" ${S.config.requireApproval?"checked":""} style="margin-top:4px"> <span>Every new market needs approval <span class="muted small">(flagged markets always do)</span></span></label>
+          <div class="two"><label class="field"><span>Starting credits</span><input type="number" id="s-start" min="0" step="50" value="${S.config.startBalance}"></label><label class="field"><span>Top-up amount</span><input type="number" id="s-top" min="0" step="50" value="${S.config.topUp}"></label></div>
+          <div><button class="btn small primary" type="submit">Save settings</button><span class="msg" id="s-msg"></span></div>
+        </form></div>`}
+    </div>`;
+  hydrateNames(main);
+}
+
+// players: who's allowed on the board
+function membersBy(status){
+  return [...S.members.entries()].map(([uid,m])=>({uid,...m})).filter(m=>m.status===status);
+}
+function roleOf(uid){
+  const m=S.members.get(uid);
+  return m?.owner ? "owner" : S.mods.includes(uid) ? "mod" : "player";
+}
+// Owner decides on anyone but themselves. Moderators decide on players only.
+const canDecide = uid => uid!==S.uid && roleOf(uid)!=="owner" && (S.isOwner || roleOf(uid)==="player");
+const memberName = m => esc(m.name || "Player " + m.uid.slice(-4));
+function requestsPanel(){
+  const rq=membersBy("pending").sort((a,b)=>a.requestedAt-b.requestedAt);
+  return `<div class="panel"><p class="sectitle">Sign-up requests (${rq.length})</p>
+    ${rq.length?`<table class="t"><tbody>${rq.map(m=>`<tr><td><b>${memberName(m)}</b><div class="small muted">Asked ${esc(dtStr(m.requestedAt))}</div></td>
+      <td class="r"><div class="row-actions"><button class="btn small primary" data-member="${esc(m.uid)}|approved">Let in</button><button class="btn small" data-member="${esc(m.uid)}|rejected">Reject</button></div></td></tr>`).join("")}</tbody></table>`
+    :`<p class="muted" style="margin:0">Nobody waiting. When someone creates an account from your link, they show up here.</p>`}
+    <div class="msg" id="rq-msg"></div></div>`;
+}
+function playersPanel(){
+  const order={owner:0,mod:1,player:2};
+  const ps=membersBy("approved").sort((a,b)=>order[roleOf(a.uid)]-order[roleOf(b.uid)] || memberName(a).localeCompare(memberName(b)));
+  const label={owner:`<span class="pill open">Owner</span>`, mod:`<span class="pill yes">Moderator</span>`, player:`<span class="pill">Player</span>`};
+  return `<div class="panel"><p class="sectitle">Players (${ps.length})</p>
+    <p class="small muted" style="margin:0 0 10px">${S.isOwner
+      ? "Moderators can let people in, remove players, approve markets and settle disputes. Only you can choose moderators or remove one."
+      : "As a moderator you can let people in and remove players. Only the owner can change moderators."}</p>
+    <div class="scroll"><table class="t"><tbody>${ps.map(m=>{ const r=roleOf(m.uid); const acts=[];
+      if (S.isOwner && r==="player") acts.push(`<button class="btn small" data-mkmod="${esc(m.uid)}">Make moderator</button>`);
+      if (S.isOwner && r==="mod") acts.push(`<button class="btn small" data-unmod="${esc(m.uid)}">Remove moderator</button>`);
+      if (canDecide(m.uid)) acts.push(`<button class="btn small danger" data-member="${esc(m.uid)}|removed">Remove from board</button>`);
+      return `<tr><td>${who(m.uid)}</td><td>${label[r]}</td><td class="r"><div class="row-actions">${acts.join("")}</div></td></tr>`; }).join("")}</tbody></table></div>
+    <div class="msg" id="pl-msg"></div></div>`;
+}
+function outPanel(){
+  const out=[...membersBy("rejected"),...membersBy("removed")].sort((a,b)=>(b.decidedAt||0)-(a.decidedAt||0));
+  if (!out.length) return "";
+  return `<div class="panel"><p class="sectitle">Rejected and removed (${out.length})</p>
+    <table class="t"><tbody>${out.map(m=>`<tr><td><b>${memberName(m)}</b><div class="small muted">${m.status==="rejected"?"Rejected":"Removed"}${m.decidedAt?" "+esc(dateStr(m.decidedAt)):""}</div></td>
+      <td class="r">${canDecide(m.uid)?`<button class="btn small" data-member="${esc(m.uid)}|approved">Let back in</button>`:""}</td></tr>`).join("")}</tbody></table>
+    <div class="msg" id="out-msg"></div></div>`;
+}
+async function setMember(uid, status, btn){
+  const m=S.members.get(uid); const name=m?.name||"this player";
+  if (status==="removed" && !confirm(`Remove ${name} from the board? They lose access straight away. Their past bets stay on the record, and you can let them back in later.`)) return;
+  btn.disabled=true;
+  try{
+    if (status!=="approved" && S.mods.includes(uid)) await S.db.doc("admin/mods").set({ids:S.mods.filter(x=>x!==uid)});
+    await S.db.doc("members/"+uid).update({status, decidedAt:now(), decidedBy:S.uid});
+  }catch(e){ btn.disabled=false; say(status==="removed"?"pl-msg":m?.status==="pending"?"rq-msg":"out-msg", writeErr(e), "err"); }
+}
+async function setMods(ids, btn){
+  if (btn) btn.disabled=true;
+  try{ await S.db.doc("admin/mods").set({ids:[...new Set(ids)]}); }
+  catch(e){ say("pl-msg", writeErr(e), "err"); if (btn) btn.disabled=false; }
+}
+
+function renderRules(){
+  main.innerHTML = `<div class="prose">
+    <h1 style="font-size:32px;font-weight:800">How it works</h1>
+    <p>Woody Polymarket is a prediction game about public goings-on around the Bruderhof communities: the farms, the workshops, Plough's books, new communities and open events. Everyone starts with <b class="num">${fmt(S.config.startBalance)}</b> play credits. Credits can't be bought or cashed out.</p>
+    <h2>Odds</h2>
+    <p>Each market shows the chance of YES. Buying YES shares pushes that number up; buying NO pushes it down. A share pays 1 credit if its side wins and nothing if it loses, so a YES share priced at 0.30 cr is the market saying "30% likely".</p>
+    <p>Prices come from an automated market maker, so there's always someone to trade with. The market's creator puts in liquidity to start it and picks the opening odds. They get whatever is left in the pool when it settles.</p>
+    <h2>Settling</h2>
+    <p>When trading closes, the creator checks what happened and reports YES, NO or N/A. N/A refunds everyone. Anyone can dispute a result for ${DISPUTE_HOURS} hours, and a moderator can change it. Balances update automatically.</p>
+    <h2>House rules</h2>
+    <ul class="rules">
+      <li>Bet on public, checkable events: openings, announcements, publications, harvests, sales, weather.</li>
+      <li>No markets about a named or identifiable person's private life: relationships, pregnancy, health, faith, membership, or death.</li>
+      <li>Nothing involving children.</li>
+      <li>Every market spells out exactly what counts as YES.</li>
+    </ul>
+    <h2>Who can play</h2>
+    <p>The board is invite-only. New accounts wait until the owner or a moderator lets them in, and players who break the house rules can be removed.</p>
+    <p class="muted small" style="margin-top:22px">Markets that mention sensitive words go to a moderator automatically.</p>
+  </div>`;
+}
+
+// ---------- events ----------
+document.addEventListener("click", async e=>{
+  const t=e.target.closest("button,a"); if (!t) return;
+  if (t.matches("#tabs button")) return setView(t.dataset.view);
+  if (t.id==="brand"){ e.preventDefault(); return setView("markets"); }
+  if (t.dataset.go){ e.preventDefault(); return setView(t.dataset.go); }
+  if (t.dataset.market){ e.preventDefault(); return setView("market", t.dataset.market); }
+  if (t.dataset.status){ S.filterStatus=t.dataset.status; return renderList(); }
+  if (t.dataset.side){ S.side=t.dataset.side; return refreshTicket(); }
+  if (t.dataset.amt){ const bal=S.uid?balanceOf(S.uid):0; $("#t-amt").value = t.dataset.amt==="max" ? Math.floor(bal) : t.dataset.amt; return refreshTicket(); }
+  if (t.id==="t-buy") return doBuy();
+  if (t.dataset.sell) return doSell(t.dataset.sell, t);
+  if (t.id==="topup") return doTopup(t);
+  if (t.dataset.approve) return moderate(t.dataset.approve, "approve", t);
+  if (t.dataset.reject) return moderate(t.dataset.reject, "reject", t);
+  if (t.dataset.dismiss) return dismissDispute(t.dataset.dismiss, t);
+  if (t.dataset.unmod) return setMods(S.mods.filter(id=>id!==t.dataset.unmod), t);
+  if (t.dataset.mkmod) return setMods([...S.mods, t.dataset.mkmod], t);
+  if (t.dataset.member){ const [uid,st]=t.dataset.member.split("|"); return setMember(uid, st, t); }
+  if (t.id==="seed") return seedExamples(t);
+  if (t.id==="signout" || t.dataset.signout) return S.platform?.signOut?.();
+});
+document.addEventListener("submit", e=>{
+  e.preventDefault();
+  const f=e.target;
+  if (f.id==="f-create") return doCreate();
+  if (f.id==="f-resolve") return doResolve(f);
+  if (f.id==="f-comment") return doComment();
+  if (f.id==="f-dispute") return doDispute();
+  if (f.id==="f-settings") return doSettings();
+  if (f.id==="f-login") return doLogin(e.submitter?.dataset.mode==="create", e.submitter);
+});
+function say(id, text, kind=""){ const el=$("#"+id); if (el){ el.textContent=text; el.className="msg "+kind; } }
+
+async function doLogin(create, btn){
+  const name=$("#l-user").value.trim().toLowerCase(), pass=$("#l-pass").value;
+  if (!USERNAME_RE.test(name)) return say("l-msg","Usernames are 3–20 characters: letters, numbers, dashes or underscores.","err");
+  if (pass.length<6) return say("l-msg","Passwords need at least 6 characters.","err");
+  if (btn) btn.disabled=true;
+  say("l-msg", create?"Creating your account…":"Signing in…");
+  const err=await S.platform.signIn(name, pass, create);
+  if (err){ say("l-msg", err, "err"); if (btn) btn.disabled=false; }
+}
+async function doBuy(){
+  const m=S.markets.get(S.marketId); if (!m || status(m)!=="open") return;
+  const M=Math.floor(Number($("#t-amt").value)||0); const side=S.side;
+  const btn=$("#t-buy"); btn.disabled=true;
+  try{
+    const ok = await saveMine(book=>{
+      recompute(); const ms=S._ms.get(m.id);
+      if (M<1 || M>balanceOf(S.uid)+1e-9) return false;
+      const q=quoteBuy(ms.pool,m.p,side,M);
+      book.trades.push({id:uidMint(), m:m.id, side, type:"buy", amt:M, shares:+q.shares.toFixed(6), ts:now()});
+    });
+    say("t-msg", ok?`Bought ${side}.`:"Not enough credits for that.", ok?"ok":"err");
+  }catch(err){ say("t-msg", writeErr(err), "err"); }
+  btn.disabled=false; refreshTicket();
+}
+async function doSell(side, btn){
+  const m=S.markets.get(S.marketId); btn.disabled=true;
+  try{
+    await saveMine(book=>{
+      recompute(); const ms=S._ms.get(m.id); const ps=ms.pos.get(S.uid); if (!ps) return false;
+      const sh = side==="YES"?ps.yes:ps.no; if (sh<1e-6) return false;
+      const q=quoteSell(ms.pool,m.p,side,sh);
+      book.trades.push({id:uidMint(), m:m.id, side, type:"sell", amt:+q.credits.toFixed(6), shares:+sh.toFixed(6), ts:now()});
+    });
+  }catch(err){ say("sell-msg", writeErr(err), "err"); btn.disabled=false; }
+}
+async function doTopup(btn){
+  btn.disabled=true;
+  try{ await saveMine(b=>{ b.grants.push({amt:S.config.topUp, ts:now()}); }); }catch(err){ btn.textContent=writeErr(err); }
+}
+async function doCreate(){
+  const q=$("#c-q").value.trim(), crit=$("#c-crit").value.trim(), src="", desc=$("#c-desc").value.trim();
+  const p=clampP(+$("#c-p").value/100), L=Math.floor(Number($("#c-L").value)||0);
+  const closeAt=new Date($("#c-close").value).getTime();
+  const err = !canAct() ? "You need edit access to create markets."
+    : q.length<10 ? "Write the question in full (at least 10 characters)."
+    : crit.length<10 ? "Spell out exactly what makes it resolve YES."
+    : !(closeAt>now()+36e5) ? "Set the close time at least an hour from now."
+    : L<50 ? "Liquidity must be at least 50 credits."
+    : L>balanceOf(S.uid) ? `You only have ${fmt(balanceOf(S.uid))} credits.`
+    : !($("#k1").checked&&$("#k2").checked&&$("#k3").checked) ? "Tick all three house rules to submit."
+    : "";
+  if (err) return say("c-msg", err, "err");
+  const flags=flagWords([q,crit,desc].join(" "));
+  const st = (S.config.requireApproval && !S.isAdmin) || flags.length ? "pending" : "open";
+  const ref=S.db.collection("markets").doc();
+  const doc={id:ref.id, q, criteria:crit, source:src, desc, p, L, closeAt, creator:S.uid, createdAt:now(), status:st, flags};
+  $("#c-submit").disabled=true;
+  try{ await ref.set(doc); S.markets.set(doc.id, doc); recompute(); setView("market", doc.id); }
+  catch(e){ say("c-msg", writeErr(e), "err"); $("#c-submit").disabled=false; }
+}
+async function doResolve(f){
+  const m=S.markets.get(S.marketId); const outcome=f.querySelector("input[name=outcome]:checked").value; const note=$("#r-note").value.trim();
+  if (!note) return say("r-msg","Add the evidence you checked.","err");
+  try{ await S.db.doc("markets/"+m.id).update({status:"resolved", resolution:{outcome, note, by:S.uid, at:now()}}); }
+  catch(e){ say("r-msg", writeErr(e), "err"); }
+}
+async function doComment(){
+  const text=$("#c-text").value.trim(); if (!text) return;
+  if (!canAct()) return say("c-msg","You need edit access to comment.","err");
+  try{ await saveMine(b=>{ b.comments.push({id:uidMint(), m:S.marketId, text, ts:now()}); if (b.comments.length>300) b.comments.splice(0,b.comments.length-300); }); $("#c-text").value=""; say("c-msg","Posted.","ok"); }
+  catch(e){ say("c-msg", writeErr(e), "err"); }
+}
+async function doDispute(){
+  const reason=$("#dp-text").value.trim(); if (!reason) return;
+  try{ await saveMine(b=>{ b.disputes.push({id:uidMint(), m:S.marketId, reason, ts:now()}); }); }
+  catch(e){ say("dp-msg", writeErr(e), "err"); }
+}
+async function moderate(id, action, btn){
+  btn.disabled=true;
+  try{
+    if (action==="approve") await S.db.doc("markets/"+id).update({status:"open"});
+    else { const r=($("#rr-"+id)?.value||"").trim(); await S.db.doc("markets/"+id).update({status:"rejected", rejectReason:r||"Breaks the house rules"}); }
+  }catch(e){ btn.disabled=false; btn.textContent=writeErr(e); }
+}
+async function dismissDispute(key, btn){
+  const [mid,did]=key.split("|"); const m=S.markets.get(mid); btn.disabled=true;
+  try{ await S.db.doc("markets/"+mid).update({dismissed:[...(m.dismissed||[]), did]}); }catch(e){ btn.textContent=writeErr(e); }
+}
+async function doSettings(){
+  const cfg={requireApproval:$("#s-appr").checked, startBalance:Math.max(0,Math.floor(+$("#s-start").value||0)), topUp:Math.max(0,Math.floor(+$("#s-top").value||0))};
+  try{ await S.db.doc("admin/config").set(cfg); say("s-msg","Saved.","ok"); }catch(e){ say("s-msg", writeErr(e), "err"); }
+}
+
+const EXAMPLES = [
+  ["Will bruderhof.com list 25 or more communities by 30 June 2027?","The communities page on bruderhof.com shows 25 or more distinct Bruderhof communities at any point on or before 30 June 2027 (Sydney time).",0.4,1814363940000],
+  ["Will a fourth Australian Bruderhof community open by the end of 2027?","A Bruderhof community in Australia other than Danthonia, Inverell and Armidale is publicly announced as open by 31 Dec 2027.",0.15,1830257940000],
+  ["Will Plough Quarterly release a new issue before 15 December 2026?","plough.com lists a new Plough Quarterly issue released between 19 Oct and 15 Dec 2026.",0.75,1797339540000],
+  ["Will Danthonia hold a public open day or farm event before 31 March 2027?","A public event at Danthonia (open day, farm stand, concert or similar) is announced publicly, dated on or before 31 Mar 2027.",0.55,1806497940000],
+  ["Will the Bruderhof open a community in a new country by the end of 2028?","A community opens in a country other than the US, UK, Germany, Austria, Paraguay, South Korea or Australia by 31 Dec 2028.",0.2,1861880340000],
+  ["Will Inverell record more than 60 mm of rain in November 2026?","The Bureau of Meteorology monthly total for November 2026 at Inverell is above 60 mm.",0.45,1796043540000]
+];
+async function seedExamples(btn){
+  btn.disabled=true;
+  try{
+    for (const [q,criteria,p,closeAt] of EXAMPLES){
+      if (closeAt<=now()) continue;
+      const ref=S.db.collection("markets").doc();
+      await ref.set({id:ref.id,q,criteria,source:"",desc:"Example market.",p,L:300,closeAt,creator:HOUSE,createdAt:now(),status:"open",flags:[]});
+    }
+  }catch(e){ btn.textContent=writeErr(e); }
+}
+
+// ---------- platforms ----------
+// Inside claude.ai the page uses the built-in shared store. On a self-hosted copy
+// (window.WOODY_FIREBASE set), the same calls go to Firebase with username + password sign-in.
+async function claudePlatform(){
+  const cl=window.claude; if (!cl?.use) return null;
+  const [db,user]=await Promise.all([cl.use("db"), cl.use("user")]);
+  return {kind:"claude", db, user, signedIn: !!db};
+}
+const initialAvatar = (name) => {
+  const ch=esc((name||"?").trim().charAt(0).toUpperCase()||"?");
+  return "data:image/svg+xml,"+encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40"><rect width="40" height="40" rx="20" fill="#0441B4"/><text x="20" y="26" font-size="18" font-family="sans-serif" text-anchor="middle" fill="#fff">${ch}</text></svg>`);
+};
+// Usernames sign in through Firebase's email/password provider. Each username maps to an
+// address on a reserved domain that never receives mail, so players never enter an email.
+const USER_DOMAIN = "woody.example.com";
+const USERNAME_RE = /^[a-z0-9_-]{3,20}$/;
+const usernameOf = email => (email||"").split("@")[0];
+function authErr(e){
+  const c=e?.code||"";
+  if (/invalid-credential|wrong-password|user-not-found|invalid-login/.test(c)) return "Wrong username or password.";
+  if (c.includes("email-already-in-use")) return "That username is taken. Pick another, or sign in if it's yours.";
+  if (c.includes("weak-password")) return "Passwords need at least 6 characters.";
+  if (c.includes("too-many-requests")) return "Too many tries. Wait a few minutes and try again.";
+  if (c.includes("operation-not-allowed")) return "Password sign-in isn't switched on for this board yet. Turn on Email/Password in Firebase Authentication.";
+  if (/api-key|configuration-not-found|invalid-app|app-not-authorized|unauthorized-domain/.test(c)) return "This board's Firebase settings aren't right. Check site/config.js and the README.";
+  if (c.includes("network")) return "Couldn't reach the server. Check your connection.";
+  console.warn("Sign-in failed:", e);
+  return "That didn't work. Try again." + (c ? ` (${c})` : "");
+}
+async function firebasePlatform(cfg){
+  firebase.initializeApp(cfg.firebaseConfig);
+  const auth=firebase.auth(), fs=firebase.firestore();
+  const u = await new Promise(r=>{ const off=auth.onAuthStateChanged(x=>{ off(); r(x); }); });
+  const isOwner = !!u && (u.email||"").toLowerCase()===((cfg.ownerUsername||"").toLowerCase()+"@"+USER_DOMAIN);
+  const myName = u ? (u.displayName || usernameOf(u.email)) : "";
+  const prof=new Map();
+  if (u){
+    try{ await fs.doc("profiles/"+u.uid).set({name:myName, photo:u.photoURL||""}); }catch{}
+    fs.collection("profiles").onSnapshot(s=>{ s.docs.forEach(d=>prof.set(d.id,d.data())); if (S._ms) hydrateNames(document); }, ()=>{});
+  }
+  const user={
+    me: async()=>({id:u?.uid||null, name:myName, avatarUrl:u?.photoURL||initialAvatar(myName), isOwner, canEdit:isOwner, email:u?.email||null}),
+    can: async()=> u ? null : false,
+    profiles: async ids=>{ const out={}; for (const id of [].concat(ids)){ const p=prof.get(id); out[id]={id, name:p?.name||"", avatarUrl:p?.photo||initialAvatar(p?.name), isMe:id===u?.uid}; } return out; }
+  };
+  return {
+    kind:"firebase", db: u ? fs : null, user, signedIn:!!u,
+    signIn: async(name, pass, create)=>{
+      const email=name+"@"+USER_DOMAIN;
+      try{
+        if (create){ const c=await auth.createUserWithEmailAndPassword(email, pass); await c.user.updateProfile({displayName:name}); }
+        else await auth.signInWithEmailAndPassword(email, pass);
+        location.reload(); return null;
+      }catch(e){ return authErr(e); }
+    },
+    signOut: async()=>{ await auth.signOut(); location.reload(); }
+  };
+}
+// Local test server (node server.js): the same calls go over fetch to the Node server,
+// and changes stream back over Server-Sent Events.
+async function localPlatform(){
+  const api = async (route, body) => {
+    const r = await fetch("/api/"+route, body ? {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)} : {});
+    const j = await r.json().catch(()=>({}));
+    if (!r.ok){ const e=new Error(j.error||r.statusText); e.code=j.code; throw e; }
+    return j;
+  };
+  const me = await api("me");
+  const docs = new Map();
+  const user = {
+    me: async()=>({id:me.uid, name:me.name||"", avatarUrl:initialAvatar(me.name), isOwner:!!me.isOwner, canEdit:!!me.isOwner, email:null}),
+    can: async()=> me.uid ? null : false,
+    profiles: async ids=>{ const out={}; for (const id of [].concat(ids)){ const p=docs.get("profiles/"+id); out[id]={id, name:p?.name||"", avatarUrl:initialAvatar(p?.name), isMe:id===me.uid}; } return out; }
+  };
+  const P = {
+    kind:"local", db:null, user, signedIn:!!me.uid,
+    signIn: async(name, pass, create)=>{ try{ await api(create?"signup":"login", {username:name, password:pass}); location.reload(); return null; }catch(e){ return authErr(e); } },
+    signOut: async()=>{ await api("logout", {}); location.reload(); }
+  };
+  if (!me.uid) return P;
+  // Listeners are keyed by "collection/id" (one doc) or "collection" (all docs in it).
+  const subs = new Set();
+  const snap = p => { const d=docs.get(p); return {id:p.slice(p.indexOf("/")+1), exists:d!==undefined, data:()=>structuredClone(d)}; };
+  const fire = s => s.key.includes("/") ? s.fn(snap(s.key)) : s.fn({docs:[...docs.keys()].filter(k=>k.startsWith(s.key+"/")).map(snap)});
+  const listen = (key, fn) => { const s={key, fn}; subs.add(s); queueMicrotask(()=>fire(s)); return ()=>subs.delete(s); };
+  const ref = p => ({ id:p.slice(p.indexOf("/")+1),
+    set: d=>api("write", {op:"set", path:p, data:d}),
+    update: d=>api("write", {op:"update", path:p, data:d}),
+    onSnapshot: fn=>listen(p, fn) });
+  P.db = { doc:ref, collection: c=>({ doc:()=>ref(c+"/"+uidMint()), onSnapshot: fn=>listen(c, fn) }) };
+  await new Promise((resolve, reject)=>{
+    let ready=false;
+    const es=new EventSource("/api/stream");
+    es.addEventListener("init", e=>{ docs.clear(); for (const [k,v] of Object.entries(JSON.parse(e.data))) docs.set(k,v); if (ready) subs.forEach(fire); ready=true; resolve(); });
+    es.addEventListener("change", e=>{
+      const {path:p, data:d}=JSON.parse(e.data); const col=p.split("/")[0];
+      if (d==null) docs.delete(p); else docs.set(p,d);
+      subs.forEach(s=>{ if (s.key===p || s.key===col) fire(s); });
+      if (col==="profiles" && S._ms) hydrateNames(document);
+    });
+    es.onerror = ()=>{ if (!ready){ es.close(); reject(new Error("Can't reach the local server")); } };
+  });
+  return P;
+}
+function applyMods(){
+  S.isAdmin = S.isOwner || (!!S.uid && S.mods.includes(S.uid));
+  updateModTab();
+}
+
+// ---------- boot ----------
+function routeFromHash(){
+  const h=(location.hash||"").slice(1);
+  if (h.startsWith("m-")) return ["market", h.slice(2)];
+  if (["markets","create","mine","leaders","mod","rules"].includes(h)) return [h,null];
+  return ["markets",null];
+}
+async function boot(){
+  const [v,id]=routeFromHash(); S.view=v; S.marketId=id;
+  document.querySelectorAll("#tabs button").forEach(b=>b.setAttribute("aria-current", b.dataset.view===v ? "page":"false"));
+  let P=null;
+  // Opening index.html as a file (or before Firebase is filled in) loads the placeholder
+  // config.js, so sign-in could never work. Say how to run it instead of showing a dead form.
+  const fb=window.WOODY_FIREBASE;
+  const fbUnset = fb && Object.values(fb.firebaseConfig||{}).some(v=>!v || v==="PASTE_HERE");
+  if (!window.WOODY_LOCAL && (location.protocol==="file:" || fbUnset)){
+    main.innerHTML=`<div class="empty"><h3>This board isn't connected yet</h3>
+      <p>To try it on this computer, run <code>node server.js</code> in the project folder, then open <a href="http://localhost:8080/">http://localhost:8080</a>. Opening index.html directly won't work.</p>
+      <p>To put it online, fill in the Firebase settings in <code>site/config.js</code> (see the README).</p></div>`;
+    return;
+  }
+  try{
+    P = window.WOODY_LOCAL ? await localPlatform()
+      : (window.WOODY_FIREBASE && window.firebase) ? await firebasePlatform(window.WOODY_FIREBASE)
+      : await claudePlatform();
+  }
+  catch(e){ console.error(e); }
+  if (!P){ main.innerHTML=`<div class="empty"><h3>This board can't connect</h3><p>Open it on claude.ai, check the Firebase settings in your hosted copy, or if you're testing locally, make sure <code>node server.js</code> is running.</p></div>`; return; }
+  S.platform=P; S.db=P.db; S.user=P.user;
+  const slot=$("#auth-slot");
+  if (P.kind!=="claude" && P.signedIn){ slot.hidden=false; slot.innerHTML = `<button class="btn small ghost" id="signout">Sign out</button>`; }
+  if (P.user){
+    const me=await P.user.me(); S.uid=me.id; S.isOwner=!!me.isOwner; S.myName=me.name||"";
+    if (me.id){ const a=$("#me-avatar"); a.src=me.avatarUrl; a.hidden=false; }
+    S.canWrite = await P.user.can("data.write");
+  }
+  applyMods();
+  if (!S.db){
+    main.innerHTML = P.kind!=="claude"
+      ? `<div class="panel login">
+          <img class="login-logo" src="img/logo-192.png" alt="">
+          <h2 style="font-size:22px;margin-bottom:6px">Sign in</h2>
+          <p class="muted small" style="margin:0 0 14px">New here? Pick a username and password, then press <b>Create account</b>. The owner lets new players in, then you get ${fmt(S.config.startBalance)} free play credits. Credits can't be bought or cashed out.</p>
+          <form id="f-login" class="stack" style="gap:12px">
+            <label class="field"><span>Username</span><input type="text" id="l-user" autocomplete="username" autocapitalize="none" spellcheck="false" maxlength="20" required></label>
+            <label class="field"><span>Password</span><input type="password" id="l-pass" autocomplete="current-password" required></label>
+            <div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn primary" type="submit" data-mode="signin">Sign in</button><button class="btn" type="submit" data-mode="create">Create account</button></div>
+            <div class="msg" id="l-msg"></div>
+          </form></div>`
+      : `<div class="empty"><h3>Sign in to join the board</h3><p>Markets and credits are shared between signed-in players. Sign in to claude.ai and reopen this page.</p></div>`;
+    return;
+  }
+  if (P.kind==="claude") return startBoard();
+  // Invite-only: watch our own membership record and only open the board once approved.
+  const meRef=S.db.doc("members/"+S.uid);
+  meRef.onSnapshot(s=>{
+    const m = s.exists ? s.data() : null, was = S.myMember?.status;
+    S.myMember = m;
+    if (S.isOwner){
+      if (!m || m.status!=="approved" || !m.owner) meRef.set({status:"approved", owner:true, name:S.myName, requestedAt:m?.requestedAt||now()}).catch(e=>console.warn(e));
+      return startBoard();
+    }
+    if (!m){ meRef.set({status:"pending", name:S.myName, requestedAt:now()}).catch(e=>console.warn(e)); return gateScreen("pending"); }
+    if (m.status==="approved"){ if (was && was!=="approved") location.reload(); else startBoard(); return; }
+    stopBoard(); gateScreen(m.status);
+  }, e=>{ console.warn(e); gateScreen("pending"); });
+}
+function gateScreen(status){
+  S.gated=true; S.loaded.markets=false;
+  $("#tabs").hidden=true; $("#wallet").hidden=true;
+  const name=esc(S.myName||"there");
+  const copy = {
+    pending:["You're on the list", `Thanks, ${name}. The owner lets new players in by hand. This page opens by itself as soon as you're approved, so you can leave it open or come back later.`],
+    rejected:["Your request wasn't approved", "You can't join this board. If you think that's a mistake, ask the person who sent you the link."],
+    removed:["You've been removed from this board", "Your account no longer has access. If you think that's a mistake, ask the person who runs the board."]
+  }[status] || ["You can't see this board yet", "Ask the person who sent you the link."];
+  main.innerHTML = `<div class="empty gate"><img class="empty-logo" src="img/logo-192.png" alt=""><h3>${copy[0]}</h3><p>${copy[1]}</p>
+    <p class="small">Signed in as <b>${name}</b>. <button class="btn small" data-signout="1" style="margin-left:6px">Sign out</button></p></div>`;
+}
+function startBoard(){
+  if (S.unsubs.length) return;
+  S.gated=false; $("#tabs").hidden=false; $("#wallet").hidden=false;
+  const db=S.db;
+  const fail = e => { if (!S.gated && (e?.code==="revoked"||e?.code==="permission-denied")) main.innerHTML=`<div class="empty"><h3>This board isn't available right now</h3></div>`; };
+  S.unsubs.push(
+    db.doc("admin/config").onSnapshot(s=>{ if (s.exists) S.config={...S.config, ...s.data()}; if (S._ms){ recompute(); refresh(); } }, fail),
+    db.doc("admin/mods").onSnapshot(s=>{ S.mods = s.exists ? (s.data().ids||[]) : []; applyMods(); if (S._ms) refresh(); }, ()=>{}),
+    db.collection("markets").onSnapshot(snap=>{
+      S.markets=new Map(snap.docs.map(d=>[d.id, {...d.data(), id:d.id}]));
+      S.loaded.markets=true; recompute();
+      if (!S._first){ S._first=true; render(true); } else refresh();
+    }, fail),
+    db.collection("bets").onSnapshot(snap=>{
+      S.books=new Map(snap.docs.map(d=>[d.id, d.data()]));
+      S.loaded.books=true; if (S.loaded.markets){ recompute(); refresh(); }
+    }, fail)
+  );
+  if (S.platform?.kind!=="claude") S.unsubs.push(db.collection("members").onSnapshot(snap=>{
+    S.members=new Map(snap.docs.map(d=>[d.id, d.data()]));
+    if (S._ms) refresh();
+  }, ()=>{}));
+}
+function stopBoard(){
+  for (const off of S.unsubs) try{ off(); }catch{}
+  S.unsubs=[]; S._first=false; S.loaded.markets=false;
+  S.markets=new Map(); S.books=new Map(); S.members=new Map();
+}
+boot();
+})();
+</script>
+
+</body>
+</html>

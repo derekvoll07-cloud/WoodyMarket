@@ -1,0 +1,145 @@
+# User Operations
+mutation InsertUser($email: String!, $displayName: String!) @auth(level: USER) {
+  user_insert(data: {id_expr: "auth.uid", email: $email, displayName: $displayName})
+}
+
+mutation UpdateUser($displayName: String) @auth(level: USER) {
+  user_update(key: {id_expr: "auth.uid"}, data: {displayName: $displayName})
+}
+
+mutation DeleteUser @auth(level: USER) {
+  user_delete(key: {id_expr: "auth.uid"})
+}
+
+query GetCurrentUser @auth(level: USER) {
+  user(key: {id_expr: "auth.uid"}) {
+    id email displayName avatarUrl
+  }
+}
+
+query ListUsers @auth(level: PUBLIC, insecureReason: "Public directory of users is allowed.") {
+  users {
+    id displayName avatarUrl
+  }
+}
+
+# Project Operations
+mutation CreateProject($title: String!, $description: String) @auth(level: USER) {
+  project_insert(data: {title: $title, description: $description, owner: {id_expr: "auth.uid"}})
+}
+
+mutation UpdateProject($id: UUID!, $title: String) @auth(level: USER) {
+  project_update(id: $id, data: {title: $title})
+}
+
+mutation DeleteProject($id: UUID!) @auth(level: USER) {
+  project_delete(id: $id)
+}
+
+query GetProject($id: UUID!) @auth(level: PUBLIC, insecureReason: "Projects are shared resources.") {
+  project(id: $id) {
+    title description owner { displayName }
+  }
+}
+
+query ListProjects @auth(level: PUBLIC, insecureReason: "List of all projects.") {
+  projects {
+    id title createdAt
+  }
+}
+
+# Task Operations
+mutation CreateTask($title: String!, $status: String!, $projectId: UUID!) @auth(level: USER) {
+  task_insert(data: {title: $title, status: $status, project: {id: $projectId}})
+}
+
+mutation UpdateTask($id: UUID!, $status: String) @auth(level: USER) {
+  task_update(id: $id, data: {status: $status})
+}
+
+mutation DeleteTask($id: UUID!) @auth(level: USER) {
+  task_delete(id: $id)
+}
+
+query GetTask($id: UUID!) @auth(level: PUBLIC, insecureReason: "Tasks are part of public projects.") {
+  task(id: $id) {
+    title status dueDate project { title }
+  }
+}
+
+query ListTasks @auth(level: PUBLIC, insecureReason: "List of all tasks.") {
+  tasks {
+    id title status
+  }
+}
+
+# Comment Operations
+mutation CreateComment($taskId: UUID!, $content: String!) @auth(level: USER) {
+  comment_insert(data: {task: {id: $taskId}, author: {id_expr: "auth.uid"}, content: $content})
+}
+
+mutation UpdateComment($id: UUID!, $content: String) @auth(level: USER) {
+  comment_update(id: $id, data: {content: $content})
+}
+
+mutation DeleteComment($id: UUID!) @auth(level: USER) {
+  comment_delete(id: $id)
+}
+
+query GetComment($id: UUID!) @auth(level: PUBLIC, insecureReason: "Comments are part of public tasks.") {
+  comment(id: $id) {
+    content createdAt author { displayName }
+  }
+}
+
+query ListComments @auth(level: PUBLIC, insecureReason: "List of all comments.") {
+  comments {
+    id content createdAt
+  }
+}
+
+# Tag Operations
+mutation CreateTag($name: String!, $color: String!) @auth(level: USER) {
+  tag_insert(data: {name: $name, color: $color})
+}
+
+mutation UpdateTag($id: UUID!, $color: String) @auth(level: USER) {
+  tag_update(id: $id, data: {color: $color})
+}
+
+mutation DeleteTag($id: UUID!) @auth(level: USER) {
+  tag_delete(id: $id)
+}
+
+query GetTag($id: UUID!) @auth(level: PUBLIC, insecureReason: "Tags are global assets.") {
+  tag(id: $id) {
+    name color description
+  }
+}
+
+query ListTags @auth(level: PUBLIC, insecureReason: "Public list of tags.") {
+  tags {
+    id name color
+  }
+}
+
+# TaskTag (Junction Table) Operations
+mutation AddTagToTask($taskId: UUID!, $tagId: UUID!) @auth(level: USER) {
+  taskTag_insert(data: {task: {id: $taskId}, tag: {id: $tagId}})
+}
+
+mutation RemoveTagFromTask($taskId: UUID!, $tagId: UUID!) @auth(level: USER) {
+  taskTag_delete(key: {taskId: $taskId, tagId: $tagId})
+}
+
+query GetTaskTags($taskId: UUID!) @auth(level: PUBLIC, insecureReason: "Task tags are public info.") {
+  taskTags(where: {taskId: {eq: $taskId}}) {
+    tag { name color }
+  }
+}
+
+query ListTaskTags @auth(level: PUBLIC, insecureReason: "List of all task associations.") {
+  taskTags {
+    taskId tagId
+  }
+}

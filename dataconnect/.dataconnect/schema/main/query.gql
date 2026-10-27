@@ -1,0 +1,315 @@
+extend type Query {
+  """
+  ✨ Look up a single `Comment` based on `id`, `key` or `first` and return selected fields (or `null` if not found).
+  """
+  comment(
+    """
+    The unique ID of the object.
+    """
+    id: UUID
+
+    """
+    The key used to identify the object.
+    """
+    key: Comment_Key
+
+    """
+    Fetch the first row based on the filters and ordering.
+    """
+    first: Comment_FirstRow
+  ): Comment @fdc_generated(from: "Comment", purpose: QUERY_SINGLE)
+  """
+  ✨ Look up a single `Project` based on `id`, `key` or `first` and return selected fields (or `null` if not found).
+  """
+  project(
+    """
+    The unique ID of the object.
+    """
+    id: UUID
+
+    """
+    The key used to identify the object.
+    """
+    key: Project_Key
+
+    """
+    Fetch the first row based on the filters and ordering.
+    """
+    first: Project_FirstRow
+  ): Project @fdc_generated(from: "Project", purpose: QUERY_SINGLE)
+  """
+  ✨ Look up a single `Tag` based on `id`, `key` or `first` and return selected fields (or `null` if not found).
+  """
+  tag(
+    """
+    The unique ID of the object.
+    """
+    id: UUID
+
+    """
+    The key used to identify the object.
+    """
+    key: Tag_Key
+
+    """
+    Fetch the first row based on the filters and ordering.
+    """
+    first: Tag_FirstRow
+  ): Tag @fdc_generated(from: "Tag", purpose: QUERY_SINGLE)
+  """
+  ✨ Look up a single `Task` based on `id`, `key` or `first` and return selected fields (or `null` if not found).
+  """
+  task(
+    """
+    The unique ID of the object.
+    """
+    id: UUID
+
+    """
+    The key used to identify the object.
+    """
+    key: Task_Key
+
+    """
+    Fetch the first row based on the filters and ordering.
+    """
+    first: Task_FirstRow
+  ): Task @fdc_generated(from: "Task", purpose: QUERY_SINGLE)
+  """
+  ✨ Look up a single `TaskTag` based on `id`, `key` or `first` and return selected fields (or `null` if not found).
+  """
+  taskTag(
+    """
+    The key used to identify the object.
+    """
+    key: TaskTag_Key
+
+    """
+    Fetch the first row based on the filters and ordering.
+    """
+    first: TaskTag_FirstRow
+  ): TaskTag @fdc_generated(from: "TaskTag", purpose: QUERY_SINGLE)
+  """
+  ✨ Look up a single `User` based on `id`, `key` or `first` and return selected fields (or `null` if not found).
+  """
+  user(
+    """
+    The unique ID of the object.
+    """
+    id: UUID
+
+    """
+    The key used to identify the object.
+    """
+    key: User_Key
+
+    """
+    Fetch the first row based on the filters and ordering.
+    """
+    first: User_FirstRow
+  ): User @fdc_generated(from: "User", purpose: QUERY_SINGLE)
+  """
+  ✨ List `Comment` objects in the table and return selected fields, optionally filtered by `where` conditions
+  """
+  comments(
+    """
+    Filter condition to narrow down the query results.
+    """
+    where: Comment_Filter
+
+    """
+    Order the query results by specific fields.
+    """
+    orderBy: [Comment_Order!]
+
+    """
+    Number of rows to skip before starting to return the results.
+    """
+    offset: Int
+
+    """
+    Maximum number of rows to return (defaults to 100 rows).
+    """
+    limit: Int = 100
+
+    """
+    Set to true to return distinct results.
+    """
+    distinct: Boolean = false
+
+    """
+    Filter condition to apply to the groups of aggregate queries.
+    """
+    having: Comment_Having
+  ): [Comment!]! @fdc_generated(from: "Comment", purpose: QUERY_MULTIPLE)
+  """
+  ✨ List `Project` objects in the table and return selected fields, optionally filtered by `where` conditions
+  """
+  projects(
+    """
+    Filter condition to narrow down the query results.
+    """
+    where: Project_Filter
+
+    """
+    Order the query results by specific fields.
+    """
+    orderBy: [Project_Order!]
+
+    """
+    Number of rows to skip before starting to return the results.
+    """
+    offset: Int
+
+    """
+    Maximum number of rows to return (defaults to 100 rows).
+    """
+    limit: Int = 100
+
+    """
+    Set to true to return distinct results.
+    """
+    distinct: Boolean = false
+
+    """
+    Filter condition to apply to the groups of aggregate queries.
+    """
+    having: Project_Having
+  ): [Project!]! @fdc_generated(from: "Project", purpose: QUERY_MULTIPLE)
+  """
+  ✨ List `Tag` objects in the table and return selected fields, optionally filtered by `where` conditions
+  """
+  tags(
+    """
+    Filter condition to narrow down the query results.
+    """
+    where: Tag_Filter
+
+    """
+    Order the query results by specific fields.
+    """
+    orderBy: [Tag_Order!]
+
+    """
+    Number of rows to skip before starting to return the results.
+    """
+    offset: Int
+
+    """
+    Maximum number of rows to return (defaults to 100 rows).
+    """
+    limit: Int = 100
+
+    """
+    Set to true to return distinct results.
+    """
+    distinct: Boolean = false
+
+    """
+    Filter condition to apply to the groups of aggregate queries.
+    """
+    having: Tag_Having
+  ): [Tag!]! @fdc_generated(from: "Tag", purpose: QUERY_MULTIPLE)
+  """
+  ✨ List `Task` objects in the table and return selected fields, optionally filtered by `where` conditions
+  """
+  tasks(
+    """
+    Filter condition to narrow down the query results.
+    """
+    where: Task_Filter
+
+    """
+    Order the query results by specific fields.
+    """
+    orderBy: [Task_Order!]
+
+    """
+    Number of rows to skip before starting to return the results.
+    """
+    offset: Int
+
+    """
+    Maximum number of rows to return (defaults to 100 rows).
+    """
+    limit: Int = 100
+
+    """
+    Set to true to return distinct results.
+    """
+    distinct: Boolean = false
+
+    """
+    Filter condition to apply to the groups of aggregate queries.
+    """
+    having: Task_Having
+  ): [Task!]! @fdc_generated(from: "Task", purpose: QUERY_MULTIPLE)
+  """
+  ✨ List `TaskTag` objects in the table and return selected fields, optionally filtered by `where` conditions
+  """
+  taskTags(
+    """
+    Filter condition to narrow down the query results.
+    """
+    where: TaskTag_Filter
+
+    """
+    Order the query results by specific fields.
+    """
+    orderBy: [TaskTag_Order!]
+
+    """
+    Number of rows to skip before starting to return the results.
+    """
+    offset: Int
+
+    """
+    Maximum number of rows to return (defaults to 100 rows).
+    """
+    limit: Int = 100
+
+    """
+    Set to true to return distinct results.
+    """
+    distinct: Boolean = false
+
+    """
+    Filter condition to apply to the groups of aggregate queries.
+    """
+    having: TaskTag_Having
+  ): [TaskTag!]! @fdc_generated(from: "TaskTag", purpose: QUERY_MULTIPLE)
+  """
+  ✨ List `User` objects in the table and return selected fields, optionally filtered by `where` conditions
+  """
+  users(
+    """
+    Filter condition to narrow down the query results.
+    """
+    where: User_Filter
+
+    """
+    Order the query results by specific fields.
+    """
+    orderBy: [User_Order!]
+
+    """
+    Number of rows to skip before starting to return the results.
+    """
+    offset: Int
+
+    """
+    Maximum number of rows to return (defaults to 100 rows).
+    """
+    limit: Int = 100
+
+    """
+    Set to true to return distinct results.
+    """
+    distinct: Boolean = false
+
+    """
+    Filter condition to apply to the groups of aggregate queries.
+    """
+    having: User_Having
+  ): [User!]! @fdc_generated(from: "User", purpose: QUERY_MULTIPLE)
+}

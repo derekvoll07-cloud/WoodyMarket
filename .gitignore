@@ -1,0 +1,5 @@
+# Local test server data: password hashes and login sessions
+local-data.json
+node_modules/
+.firebase/
+*.log
