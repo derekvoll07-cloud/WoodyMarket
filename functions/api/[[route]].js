@@ -94,7 +94,12 @@ async function allowed(db, c, p, prev, next) {
 // The D1 binding is normally named DB, but any single D1 binding works.
 const findDb = env => env.DB || Object.values(env).find(v => v && typeof v.prepare === "function" && typeof v.batch === "function");
 
-export async function onRequest({ request, env, params }) {
+export async function onRequest(context) {
+  try { return await handle(context); }
+  catch (e) { console.error(e); return fail(500, "internal", "Server error: " + (e?.message || e)); }
+}
+
+async function handle({ request, env, params }) {
   const db = findDb(env);
   if (!db) return fail(500, "not-configured", "No D1 database is bound to this Pages project. See the README.");
   await ensureSchema(db);
