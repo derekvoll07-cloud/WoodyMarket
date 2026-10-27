@@ -90,6 +90,22 @@ async function allowed(db, c, p, prev, next) {
     && next.status === "resolved" && changedKeys(prev, next).every(k => k === "status" || k === "resolution");
 }
 
+// Display names: 2–30 characters, and not anyone else's username or display name,
+// so nobody can pass themselves off as another player.
+async function profileProblem(db, uid, doc) {
+  if (!Object.keys(doc).every(k => k === "name" || k === "photo")) return [400, "invalid-argument", "Bad profile."];
+  if (doc.photo !== undefined && (typeof doc.photo !== "string" || doc.photo.length > 500)) return [400, "invalid-argument", "Bad photo."];
+  const name = typeof doc.name === "string" ? doc.name.trim() : "";
+  if (name.length < 2 || name.length > 30 || name !== doc.name) return [400, "invalid-argument", "Names are 2–30 characters."];
+  const lower = name.toLowerCase();
+  const [user, prof] = await Promise.all([
+    db.prepare("SELECT 1 FROM users WHERE name = ? AND uid != ?").bind(lower, uid).first(),
+    db.prepare("SELECT 1 FROM docs WHERE path LIKE 'profiles/%' AND path != ? AND lower(json_extract(data, '$.name')) = ?").bind("profiles/" + uid, lower).first()
+  ]);
+  if (user || prof) return [409, "name-taken", "That name is taken."];
+  return null;
+}
+
 // ---------- api ----------
 // The D1 binding is normally named DB, but any single D1 binding works.
 // ASSETS (the static files) is a service stub that answers to any method name, so skip it.
@@ -177,6 +193,21 @@ async function handle({ request, env, params }) {
     return json(200, {}, { "Set-Cookie": cookie("", 0) });
   }
 
+  // Change your own password. Signs out every other session.
+  if (route === "password") {
+    if (!uid) return fail(401, "permission-denied", "Sign in first.");
+    const cur = String(body.current || ""), next = String(body.next || "");
+    if (next.length < 6) return fail(400, "auth/weak-password", "Password too short.");
+    const u = await db.prepare("SELECT salt, hash FROM users WHERE uid = ?").bind(uid).first();
+    if (!u || !sameString(await hashPw(cur, u.salt), u.hash)) return fail(401, "auth/invalid-credential", "Wrong password.");
+    const salt = randomHex(16);
+    await db.batch([
+      db.prepare("UPDATE users SET salt = ?, hash = ? WHERE uid = ?").bind(salt, await hashPw(next, salt), uid),
+      db.prepare("DELETE FROM sessions WHERE uid = ? AND token != ?").bind(uid, token)
+    ]);
+    return json(200, {});
+  }
+
   if (route === "write") {
     if (!uid) return fail(401, "permission-denied", "Sign in first.");
     const { op, path: p, data: doc } = body;
@@ -191,6 +222,7 @@ async function handle({ request, env, params }) {
     const next = op === "set" ? doc : { ...prev, ...doc };
     const c = await loadCaller(db, uid, owner);
     if (!(await allowed(db, c, p, prev, next))) return fail(403, "permission-denied", "Not allowed.");
+    if (col === "profiles") { const bad = await profileProblem(db, uid, next); if (bad) return fail(...bad); }
     await putDoc(db, p, next).run();
     return json(200, {});
   }

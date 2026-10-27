@@ -23,7 +23,6 @@
         <img class="avatar" id="me-avatar" alt="" hidden>
         <div><small>Credits</small><div class="num" id="me-balance">—</div></div>
       </div>
-      <div id="auth-slot" hidden></div>
     </div>
     <nav class="tabs" id="tabs" aria-label="Sections">
       <button data-view="markets">Markets</button>
@@ -32,6 +31,7 @@
       <button data-view="leaders">Leaderboard</button>
       <button data-view="mod" id="tab-mod" hidden>Admin</button>
       <button data-view="rules">How it works</button>
+      <button data-view="settings">Settings</button>
     </nav>
   </div>
 </header>
@@ -59,8 +59,13 @@ const S = {
   loaded:{markets:false, books:false},
   view:"markets", marketId:null, filterStatus:"open",
   side:"YES", writeQ:Promise.resolve(), readOnlyReason:null,
-  members:new Map(), myMember:null, myName:"", unsubs:[], gated:false
+  members:new Map(), myMember:null, myName:"", myDisplay:"", unsubs:[], gated:false
 };
+// Theme is a per-device choice: "system" follows the device, or force "light" / "dark".
+const THEME_KEY = "woody-theme";
+function getTheme(){ try{ return localStorage.getItem(THEME_KEY) || "system"; }catch{ return "system"; } }
+function applyTheme(t){ if (t==="light"||t==="dark") document.documentElement.dataset.theme=t; else delete document.documentElement.dataset.theme; }
+applyTheme(getTheme());
 const $ = (s, r=document) => r.querySelector(s);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const fmt = (n, d=0) => (Math.round(n * 10**d) / 10**d).toLocaleString(undefined,{minimumFractionDigits:d,maximumFractionDigits:d});
@@ -241,6 +246,7 @@ function render(full){
   const v=S.view;
   if (v==="market") return full ? renderDetail() : refreshDetail();
   if (v==="create") { if (full) renderCreate(); else updateCreateHints(); return; }
+  if (v==="settings") { if (full) renderSettings(); return; }
   const a=document.activeElement;
   if (!full && a && main.contains(a) && /INPUT|TEXTAREA|SELECT/.test(a.tagName)) { S._dirty=true; return; }
   if (v==="markets") renderList();
@@ -682,6 +688,63 @@ function renderRules(){
   </div>`;
 }
 
+// settings: your profile, password, theme and sign-out
+function renderSettings(){
+  const own = S.platform?.kind!=="claude";
+  const role = S.isOwner ? "Owner" : S.isAdmin ? "Moderator" : "Player";
+  const theme = getTheme();
+  main.innerHTML = `
+    <div class="listhead"><div><h1>Settings</h1><p class="muted" style="margin:6px 0 0">Your profile, your password and how the board looks on this device.</p></div></div>
+    <div class="stack" style="max-width:640px">
+      <div class="panel"><p class="sectitle">Profile</p>
+        <form id="f-name" class="stack" style="gap:12px">
+          <label class="field"><span>Display name <span class="hint">Shown on the leaderboard, on bets and on comments.</span></span>
+            <input type="text" id="st-name" maxlength="30" value="${esc(S.myDisplay)}" required></label>
+          <dl class="kv small" style="margin:0">
+            ${own?`<dt>Username</dt><dd>${esc(S.myName)} <span class="muted">· You sign in with this. It can't be changed.</span></dd>`:""}
+            <dt>Role</dt><dd>${role}</dd>
+          </dl>
+          <div><button class="btn small primary" type="submit">Save name</button><span class="msg" id="st-name-msg"></span></div>
+        </form></div>
+      ${own?`<div class="panel"><p class="sectitle">Password</p>
+        <form id="f-pass" class="stack" style="gap:12px">
+          <input type="text" autocomplete="username" value="${esc(S.myName)}" hidden>
+          <label class="field"><span>Current password</span><input type="password" id="st-cur" autocomplete="current-password" required></label>
+          <div class="two">
+            <label class="field"><span>New password <span class="hint">At least 6 characters.</span></span><input type="password" id="st-new" autocomplete="new-password" required></label>
+            <label class="field"><span>Repeat new password</span><input type="password" id="st-new2" autocomplete="new-password" required></label>
+          </div>
+          <p class="small muted" style="margin:0">Changing it signs you out everywhere else.</p>
+          <div><button class="btn small primary" type="submit">Change password</button><span class="msg" id="st-pass-msg"></span></div>
+        </form></div>`:""}
+      <div class="panel"><p class="sectitle">Appearance</p>
+        <div class="chips" role="group" aria-label="Theme">${[["system","Match device"],["light","Light"],["dark","Dark"]].map(([k,l])=>`<button class="chip" data-theme-pick="${k}" aria-pressed="${theme===k}">${l}</button>`).join("")}</div>
+        <p class="small muted" style="margin:8px 0 0">Saved on this device only.</p></div>
+      ${own?`<div class="panel"><p class="sectitle">Account</p>
+        <p class="small" style="margin:0 0 12px">Signed in as <b>${esc(S.myName)}</b>.</p>
+        <button class="btn danger" data-signout="1">Sign out</button></div>`:""}
+    </div>`;
+}
+async function doName(){
+  const name=$("#st-name").value.trim().replace(/\s+/g," ");
+  if (name.length<2 || name.length>30) return say("st-name-msg","Names are 2–30 characters.","err");
+  if (name===S.myDisplay) return say("st-name-msg","That's already your name.");
+  try{
+    await S.db.doc("profiles/"+S.uid).set({name, photo:""});
+    S.myDisplay=name; $("#me-avatar").src=initialAvatar(name);
+    say("st-name-msg","Saved.","ok"); hydrateNames(document);
+  }catch(e){ say("st-name-msg", e?.code==="name-taken" ? "Someone already uses that name. Pick another." : e?.code==="invalid-argument" ? "Names are 2–30 characters." : writeErr(e), "err"); }
+}
+async function doPassword(){
+  const cur=$("#st-cur").value, nw=$("#st-new").value, nw2=$("#st-new2").value;
+  if (nw.length<6) return say("st-pass-msg","Passwords need at least 6 characters.","err");
+  if (nw!==nw2) return say("st-pass-msg","The new passwords don't match.","err");
+  if (nw===cur) return say("st-pass-msg","Pick a password that's different from the current one.","err");
+  const err=await S.platform.changePassword(cur, nw);
+  if (err) return say("st-pass-msg", err, "err");
+  $("#f-pass").reset(); say("st-pass-msg","Password changed.","ok");
+}
+
 // ---------- events ----------
 document.addEventListener("click", async e=>{
   const t=e.target.closest("button,a"); if (!t) return;
@@ -702,7 +765,8 @@ document.addEventListener("click", async e=>{
   if (t.dataset.mkmod) return setMods([...S.mods, t.dataset.mkmod], t);
   if (t.dataset.member){ const [uid,st]=t.dataset.member.split("|"); return setMember(uid, st, t); }
   if (t.id==="seed") return seedExamples(t);
-  if (t.id==="signout" || t.dataset.signout) return S.platform?.signOut?.();
+  if (t.dataset.themePick){ try{ localStorage.setItem(THEME_KEY, t.dataset.themePick); }catch{} applyTheme(t.dataset.themePick); return renderSettings(); }
+  if (t.dataset.signout) return S.platform?.signOut?.();
 });
 document.addEventListener("submit", e=>{
   e.preventDefault();
@@ -712,6 +776,8 @@ document.addEventListener("submit", e=>{
   if (f.id==="f-comment") return doComment();
   if (f.id==="f-dispute") return doDispute();
   if (f.id==="f-settings") return doSettings();
+  if (f.id==="f-name") return doName();
+  if (f.id==="f-pass") return doPassword();
   if (f.id==="f-login") return doLogin(e.submitter?.dataset.mode==="create", e.submitter);
 });
 function say(id, text, kind=""){ const el=$("#"+id); if (el){ el.textContent=text; el.className="msg "+kind; } }
@@ -865,14 +931,19 @@ async function apiPlatform(){
   const me = await api("me");
   const docs = new Map();
   const user = {
-    me: async()=>({id:me.uid, name:me.name||"", avatarUrl:initialAvatar(me.name), isOwner:!!me.isOwner, canEdit:!!me.isOwner, email:null}),
+    me: async()=>{ const shown=docs.get("profiles/"+me.uid)?.name || me.name || "";
+      return {id:me.uid, name:me.name||"", displayName:shown, avatarUrl:initialAvatar(shown), isOwner:!!me.isOwner, canEdit:!!me.isOwner, email:null}; },
     can: async()=> me.uid ? null : false,
     profiles: async ids=>{ const out={}; for (const id of [].concat(ids)){ const p=docs.get("profiles/"+id); out[id]={id, name:p?.name||"", avatarUrl:initialAvatar(p?.name), isMe:id===me.uid}; } return out; }
   };
   const P = {
     kind:"api", db:null, user, signedIn:!!me.uid,
     signIn: async(name, pass, create)=>{ try{ await api(create?"signup":"login", {username:name, password:pass}); location.reload(); return null; }catch(e){ return authErr(e); } },
-    signOut: async()=>{ await api("logout", {}); location.reload(); }
+    signOut: async()=>{ await api("logout", {}); location.reload(); },
+    changePassword: async(current, next)=>{
+      try{ await api("password", {current, next}); return null; }
+      catch(e){ return /invalid-credential/.test(e.code||"") ? "Your current password isn't right." : authErr(e); }
+    }
   };
   if (!me.uid) return P;
   // Listeners are keyed by "collection/id" (one doc) or "collection" (all docs in it).
@@ -921,7 +992,7 @@ function applyMods(){
 function routeFromHash(){
   const h=(location.hash||"").slice(1);
   if (h.startsWith("m-")) return ["market", h.slice(2)];
-  if (["markets","create","mine","leaders","mod","rules"].includes(h)) return [h,null];
+  if (["markets","create","mine","leaders","mod","rules","settings"].includes(h)) return [h,null];
   return ["markets",null];
 }
 async function boot(){
@@ -939,10 +1010,8 @@ async function boot(){
   catch(e){ console.error(e); }
   if (!P){ main.innerHTML=`<div class="empty"><h3>This board can't connect</h3><p>The server didn't answer. Try again in a minute. If you're testing locally, make sure <code>node server.js</code> is running.</p></div>`; return; }
   S.platform=P; S.db=P.db; S.user=P.user;
-  const slot=$("#auth-slot");
-  if (P.kind!=="claude" && P.signedIn){ slot.hidden=false; slot.innerHTML = `<button class="btn small ghost" id="signout">Sign out</button>`; }
   if (P.user){
-    const me=await P.user.me(); S.uid=me.id; S.isOwner=!!me.isOwner; S.myName=me.name||"";
+    const me=await P.user.me(); S.uid=me.id; S.isOwner=!!me.isOwner; S.myName=me.name||""; S.myDisplay=me.displayName||me.name||"";
     if (me.id){ const a=$("#me-avatar"); a.src=me.avatarUrl; a.hidden=false; }
     S.canWrite = await P.user.can("data.write");
   }

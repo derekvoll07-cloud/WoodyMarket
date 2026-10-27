@@ -76,6 +76,19 @@ function allowed(uid, p, prev, next) {
     && next.status === "resolved" && changedKeys(prev, next).every(k => k === "status" || k === "resolution");
 }
 
+// Display names: 2–30 characters, and not anyone else's username or display name,
+// so nobody can pass themselves off as another player.
+function profileProblem(uid, doc) {
+  if (!Object.keys(doc).every(k => k === "name" || k === "photo")) return [400, "invalid-argument", "Bad profile."];
+  if (doc.photo !== undefined && (typeof doc.photo !== "string" || doc.photo.length > 500)) return [400, "invalid-argument", "Bad photo."];
+  const name = typeof doc.name === "string" ? doc.name.trim() : "";
+  if (name.length < 2 || name.length > 30 || name !== doc.name) return [400, "invalid-argument", "Names are 2–30 characters."];
+  const lower = name.toLowerCase();
+  const taken = Object.entries(data.users).some(([n, u]) => u.uid !== uid && n === lower)
+    || Object.entries(data.docs).some(([p, d]) => p.startsWith("profiles/") && p !== "profiles/" + uid && String(d.name || "").toLowerCase() === lower);
+  return taken ? [409, "name-taken", "That name is taken."] : null;
+}
+
 // ---------- http helpers ----------
 function json(res, status, body, headers = {}) {
   res.writeHead(status, { "Content-Type": "application/json", "Cache-Control": "no-store", ...headers });
@@ -139,6 +152,19 @@ async function api(req, res, route, query) {
     delete data.sessions[sessionToken(req)]; save();
     return json(res, 200, {}, { "Set-Cookie": `${COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0` });
   }
+  // Change your own password. Signs out every other session.
+  if (route === "password") {
+    if (!uid) return fail(res, 401, "permission-denied", "Sign in first.");
+    const cur = String(body.current || ""), next = String(body.next || "");
+    if (next.length < 6) return fail(res, 400, "auth/weak-password", "Password too short.");
+    const u = data.users[nameOf(uid)];
+    if (!crypto.timingSafeEqual(Buffer.from(hashPw(cur, u.salt), "hex"), Buffer.from(u.hash, "hex"))) return fail(res, 401, "auth/invalid-credential", "Wrong password.");
+    u.salt = crypto.randomBytes(16).toString("hex"); u.hash = hashPw(next, u.salt);
+    const mine = sessionToken(req);
+    for (const [t, id] of Object.entries(data.sessions)) if (id === uid && t !== mine) delete data.sessions[t];
+    save();
+    return json(res, 200, {});
+  }
   if (route === "write") {
     if (!uid) return fail(res, 401, "permission-denied", "Sign in first.");
     const { op, path: p, data: doc } = body;
@@ -151,6 +177,7 @@ async function api(req, res, route, query) {
     if (op !== "set" && op !== "update") return fail(res, 400, "invalid-argument", "Unknown op.");
     const next = op === "set" ? doc : { ...prev, ...doc };
     if (!allowed(uid, p, prev, next)) return fail(res, 403, "permission-denied", "Not allowed.");
+    if (col === "profiles") { const bad = profileProblem(uid, next); if (bad) return fail(res, ...bad); }
     putDoc(p, next); save();
     return json(res, 200, {});
   }
